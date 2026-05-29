@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
-"""Trigger a Railway redeploy via API. Run after git push."""
+"""Trigger a Railway fresh build from latest GitHub commit. Run after git push."""
 import os, sys, urllib.request, json
 
-TOKEN = os.environ.get("RAILWAY_TOKEN", "c81f57b6-76a8-43f6-9822-b1b023ce2ca3")
+TOKEN      = os.environ.get("RAILWAY_TOKEN", "c81f57b6-76a8-43f6-9822-b1b023ce2ca3")
 SERVICE_ID = "8e982bdc-381c-4bbc-a705-a269c624410b"
-ENV_ID = "2fe1147d-8f11-4289-96d7-d6251f6d06f9"
+ENV_ID     = "2fe1147d-8f11-4289-96d7-d6251f6d06f9"
 
-query = f'mutation {{ serviceInstanceRedeploy(environmentId: "{ENV_ID}", serviceId: "{SERVICE_ID}") }}'
+query = (
+    f'mutation {{ serviceInstanceDeploy('
+    f'serviceId: "{SERVICE_ID}", '
+    f'environmentId: "{ENV_ID}", '
+    f'latestCommit: true) }}'
+)
 payload = json.dumps({"query": query}).encode()
 req = urllib.request.Request(
     "https://backboard.railway.com/graphql/v2",
@@ -16,9 +21,9 @@ req = urllib.request.Request(
 with urllib.request.urlopen(req, timeout=15) as resp:
     result = json.loads(resp.read())
 
-if result.get("data", {}).get("serviceInstanceRedeploy"):
-    print("Railway redeploy triggered.")
+if result.get("data", {}).get("serviceInstanceDeploy"):
+    print("Railway fresh build triggered from latest commit.")
     sys.exit(0)
 else:
-    print(f"Redeploy failed: {result}", file=sys.stderr)
+    print(f"Deploy failed: {result}", file=sys.stderr)
     sys.exit(1)
