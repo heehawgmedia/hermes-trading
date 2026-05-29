@@ -109,7 +109,7 @@ def reflect_fallback() -> None:
         "version": new_version,
     }
     _append_hypothesis(hypothesis)
-    print(f"[reflect --fallback] v{strategy['version']}: {changed_var} {old_val} → {new_val}", flush=True)
+    print(f"[reflect --fallback] v{strategy['version']}: {changed_var} {old_val} -> {new_val}", flush=True)
 
 
 def reflect_hermes() -> None:

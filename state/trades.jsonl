@@ -1,0 +1,5 @@
+{"asset":"BTC/USDT","entry_price":67200.0,"exit_price":67450.5,"entry_time":"2026-05-27T10:00:00Z","exit_time":"2026-05-27T10:47:00Z","direction":"long","pnl_pct":0.00373,"strategy_version":"01"}
+{"asset":"BTC/USDT","entry_price":67100.0,"exit_price":66820.0,"entry_time":"2026-05-27T12:15:00Z","exit_time":"2026-05-27T12:58:00Z","direction":"long","pnl_pct":-0.00416,"strategy_version":"01"}
+{"asset":"BTC/USDT","entry_price":66900.0,"exit_price":67180.0,"entry_time":"2026-05-27T15:30:00Z","exit_time":"2026-05-27T16:12:00Z","direction":"long","pnl_pct":0.00419,"strategy_version":"01"}
+{"asset":"BTC/USDT","entry_price":67050.0,"exit_price":66730.0,"entry_time":"2026-05-27T18:00:00Z","exit_time":"2026-05-27T18:45:00Z","direction":"long","pnl_pct":-0.00478,"strategy_version":"01"}
+{"asset":"BTC/USDT","entry_price":66800.0,"exit_price":67020.0,"entry_time":"2026-05-27T20:30:00Z","exit_time":"2026-05-27T21:10:00Z","direction":"long","pnl_pct":0.00330,"strategy_version":"01"}

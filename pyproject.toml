@@ -11,6 +11,8 @@ dependencies = [
     "numpy>=1.26",
     "pandas>=2.2",
     "rich>=13.0",
+    "fastapi>=0.115",
+    "uvicorn>=0.32",
 ]
 
 [project.scripts]

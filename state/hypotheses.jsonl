@@ -1,0 +1,1 @@
+{"timestamp": "2026-05-28T00:33:08.449760+00:00", "mode": "fallback", "changed_var": "entry.threshold", "old_val": 30, "new_val": 32, "reason": "realised=0.0023 target=0.1 dd=0.0048 dd_limit=0.08", "version": "02"}

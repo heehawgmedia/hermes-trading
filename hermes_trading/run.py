@@ -82,6 +82,9 @@ def main() -> None:
                 "Live mode requires HERMES_TRADING_I_ACCEPT_RISK=true in .env"
             )
 
+    from hermes_trading.dashboard import start_dashboard_in_background
+    start_dashboard_in_background()
+
     from hermes_trading.loop import run_loop
     asyncio.run(run_loop(asset))
 
