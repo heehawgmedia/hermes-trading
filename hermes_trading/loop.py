@@ -1,20 +1,15 @@
-"""24/7 reliability loop — pulls data, evaluates strategy, logs paper trades."""
+"""24/7 reliability loop — pulls data, evaluates strategy, delegates execution."""
 from __future__ import annotations
 import asyncio
 import json
 import time
-import traceback
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 import yaml
 
 from hermes_trading.adapters import price as price_adapter
-from hermes_trading.adapters import onchain as onchain_adapter
-from hermes_trading.adapters import news as news_adapter
-from hermes_trading.adapters import macro as macro_adapter
-from hermes_trading.score import score as compute_score
+from hermes_trading.execution import get_executor
 
 TRADES_PATH = Path("state/trades.jsonl")
 STRATEGY_PATH = Path("state/strategy.yaml")
@@ -26,24 +21,18 @@ RETRY_ATTEMPTS = 3
 LOOP_INTERVAL_SECONDS = 60
 
 
-async def _fetch_with_retry(adapter, *args, **kwargs) -> Any:
+async def _fetch_with_retry(adapter, *args, **kwargs):
     for attempt in range(RETRY_ATTEMPTS):
         try:
             return await adapter.fetch(*args, **kwargs)
-        except Exception as e:
+        except Exception:
             if attempt == RETRY_ATTEMPTS - 1:
                 raise
-            wait = 2 ** attempt
-            await asyncio.sleep(wait)
+            await asyncio.sleep(2 ** attempt)
 
 
 def _load_strategy() -> dict:
     with open(STRATEGY_PATH) as f:
-        return yaml.safe_load(f)
-
-
-def _load_goal() -> dict:
-    with open(GOAL_PATH) as f:
         return yaml.safe_load(f)
 
 
@@ -59,12 +48,10 @@ def _compute_rsi(prices: list[float], period: int = 14) -> float:
 
 
 _price_history: list[float] = []
-_open_position: dict | None = None
 
 
-def _evaluate_strategy(strategy: dict, market: dict) -> str:
+def _evaluate_strategy(strategy: dict, market: dict, has_position: bool, entry_price: float | None) -> str:
     """Returns 'enter', 'exit', or 'hold'."""
-    global _open_position
     price = market["price"]
     entry_cfg = strategy.get("entry", {})
     indicator = entry_cfg.get("indicator", "rsi")
@@ -74,15 +61,15 @@ def _evaluate_strategy(strategy: dict, market: dict) -> str:
 
     if indicator == "rsi":
         rsi = _compute_rsi(_price_history)
-        if _open_position is None:
+        if not has_position:
             if direction == "long" and rsi < threshold:
                 return "enter"
         else:
-            entry_price = _open_position["entry_price"]
+            assert entry_price is not None
             if direction == "long" and price < entry_price * (1 - stop_loss_pct):
-                return "exit"
+                return "exit"  # stop loss
             if direction == "long" and rsi > 70:
-                return "exit"
+                return "exit"  # take profit
     return "hold"
 
 
@@ -91,71 +78,82 @@ def _log_trade(trade: dict) -> None:
         f.write(json.dumps(trade) + "\n")
 
 
-def _write_heartbeat(status: str, consecutive_failures: int) -> None:
+def _write_heartbeat(status: str, consecutive_failures: int, extra: dict | None = None) -> None:
     data = {
         "status": status,
         "last_tick": datetime.now(timezone.utc).isoformat(),
         "consecutive_failures": consecutive_failures,
     }
+    if extra:
+        data.update(extra)
     with open(HEARTBEAT_PATH, "w") as f:
         json.dump(data, f)
 
 
 async def run_loop(asset: str) -> None:
-    global _open_position, _price_history
+    global _price_history
     consecutive_failures = 0
-    print(f"Booting hermes-trading worker — asset={asset}", flush=True)
+    executor = get_executor()
+    print(f"Booting hermes-trading worker — asset={asset} mode={executor.mode}", flush=True)
 
     while True:
         tick_start = time.monotonic()
         try:
             market = await _fetch_with_retry(price_adapter, asset)
-            _price_history.append(market["price"])
+            price = market["price"]
+            _price_history.append(price)
             if len(_price_history) > 200:
                 _price_history = _price_history[-200:]
 
             strategy = _load_strategy()
-            decision = _evaluate_strategy(strategy, market)
+            position = await executor.fetch_position(asset)
+            decision = _evaluate_strategy(
+                strategy, market,
+                has_position=position is not None,
+                entry_price=position.avg_entry_price if position else None,
+            )
 
-            if decision == "enter" and _open_position is None:
-                _open_position = {
-                    "entry_price": market["price"],
-                    "entry_time": datetime.now(timezone.utc).isoformat(),
-                    "asset": asset,
-                    "direction": strategy["entry"]["direction"],
-                    "position_size_r": strategy.get("position_size_r", 0.5),
-                }
-                print(f"[ENTER] {asset} @ {market['price']:.2f}", flush=True)
+            if decision == "enter":
+                position_size_r = float(strategy.get("position_size_r", 0.5))
+                direction = strategy.get("entry", {}).get("direction", "long")
+                side = "buy" if direction == "long" else "sell"
+                order = await executor.place_market_order(asset, side, position_size_r, price)
+                print(f"[ENTER] {executor.mode} {asset} {side} qty={order.qty:.6f} @ {price:.2f}", flush=True)
 
-            elif decision == "exit" and _open_position is not None:
-                exit_price = market["price"]
-                entry_price = _open_position["entry_price"]
-                direction = _open_position["direction"]
-                pnl_pct = (exit_price - entry_price) / entry_price
-                if direction == "short":
-                    pnl_pct = -pnl_pct
-
-                trade = {
-                    "asset": asset,
-                    "entry_price": entry_price,
-                    "exit_price": exit_price,
-                    "entry_time": _open_position["entry_time"],
-                    "exit_time": datetime.now(timezone.utc).isoformat(),
-                    "direction": direction,
-                    "pnl_pct": round(pnl_pct, 6),
-                    "strategy_version": strategy.get("version", "unknown"),
-                }
-                _log_trade(trade)
-                print(f"[EXIT] {asset} @ {exit_price:.2f}  PnL={pnl_pct:.4%}", flush=True)
-                _open_position = None
+            elif decision == "exit" and position is not None:
+                entry_price = position.avg_entry_price
+                exit_order = await executor.close_position(asset, price)
+                if exit_order is not None:
+                    pnl_pct = (price - entry_price) / entry_price
+                    if position.qty < 0:
+                        pnl_pct = -pnl_pct
+                    trade = {
+                        "asset": asset,
+                        "entry_price": entry_price,
+                        "exit_price": price,
+                        "exit_time": datetime.now(timezone.utc).isoformat(),
+                        "direction": "long" if position.qty > 0 else "short",
+                        "qty": abs(position.qty),
+                        "pnl_pct": round(pnl_pct, 6),
+                        "strategy_version": strategy.get("version", "?"),
+                        "mode": executor.mode,
+                        "exit_order_id": exit_order.order_id,
+                    }
+                    _log_trade(trade)
+                    print(f"[EXIT]  {executor.mode} {asset} @ {price:.2f}  PnL={pnl_pct:.4%}", flush=True)
 
             consecutive_failures = 0
-            _write_heartbeat("ok", consecutive_failures)
+            cash = await executor.fetch_cash()
+            _write_heartbeat("ok", consecutive_failures, {
+                "mode": executor.mode,
+                "cash": round(cash, 2),
+                "has_open_position": position is not None,
+            })
 
         except Exception as exc:
             consecutive_failures += 1
             print(f"[ERROR] tick failed ({consecutive_failures}/{MAX_CONSECUTIVE_FAILURES}): {exc}", flush=True)
-            _write_heartbeat("error", consecutive_failures)
+            _write_heartbeat("error", consecutive_failures, {"last_error": str(exc)[:200]})
             if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
                 print("[CIRCUIT BREAK] too many consecutive failures — halting.", flush=True)
                 raise SystemExit(1)
