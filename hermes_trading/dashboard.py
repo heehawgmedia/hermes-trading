@@ -1,10 +1,12 @@
-"""Lightweight web dashboard for hermes-trading. Reads from state/ files."""
+"""Lightweight web dashboard for hermes-trading. Reads from state/ files
+and (when configured) live Alpaca account data."""
 from __future__ import annotations
 import json
 import os
 from pathlib import Path
 from typing import Any
 
+import httpx
 import yaml
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -12,6 +14,91 @@ from fastapi.responses import HTMLResponse, JSONResponse
 STATE_DIR = Path("state")
 
 app = FastAPI(title="hermes-trading")
+
+
+def _alpaca_configured() -> bool:
+    return bool(os.getenv("ALPACA_API_KEY", "").strip() and os.getenv("ALPACA_API_SECRET", "").strip())
+
+
+def _alpaca_headers() -> dict:
+    return {
+        "APCA-API-KEY-ID": os.getenv("ALPACA_API_KEY", "").strip(),
+        "APCA-API-SECRET-KEY": os.getenv("ALPACA_API_SECRET", "").strip(),
+    }
+
+
+def _alpaca_base() -> str:
+    return os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/")
+
+
+def _fetch_alpaca() -> dict | None:
+    """Pull live account, positions, and recent orders straight from Alpaca.
+    Returns None if not configured or the call fails (dashboard falls back to file data)."""
+    if not _alpaca_configured():
+        return None
+    base = _alpaca_base()
+    headers = _alpaca_headers()
+    try:
+        with httpx.Client(timeout=10, headers=headers) as client:
+            acct = client.get(f"{base}/v2/account").json()
+            positions = client.get(f"{base}/v2/positions").json()
+            # closed orders, newest first
+            orders = client.get(
+                f"{base}/v2/orders",
+                params={"status": "closed", "limit": 50, "direction": "desc"},
+            ).json()
+    except Exception as e:
+        print(f"[dashboard] Alpaca fetch failed: {e}", flush=True)
+        return None
+
+    if not isinstance(acct, dict) or "equity" not in acct:
+        return None
+
+    equity = float(acct.get("equity", 0))
+    last_equity = float(acct.get("last_equity", equity) or equity)
+    cash = float(acct.get("cash", 0))
+
+    pos_list = []
+    if isinstance(positions, list):
+        for p in positions:
+            pos_list.append({
+                "symbol": p.get("symbol"),
+                "qty": float(p.get("qty", 0)),
+                "avg_entry": float(p.get("avg_entry_price", 0)),
+                "market_value": float(p.get("market_value", 0)),
+                "unrealized_pl": float(p.get("unrealized_pl", 0)),
+                "unrealized_plpc": float(p.get("unrealized_plpc", 0)) * 100,
+                "current_price": float(p.get("current_price", 0) or 0),
+            })
+
+    order_list = []
+    if isinstance(orders, list):
+        for o in orders:
+            order_list.append({
+                "symbol": o.get("symbol"),
+                "side": o.get("side"),
+                "qty": o.get("filled_qty") or o.get("qty"),
+                "notional": o.get("notional"),
+                "filled_avg_price": o.get("filled_avg_price"),
+                "status": o.get("status"),
+                "submitted_at": o.get("submitted_at"),
+                "filled_at": o.get("filled_at"),
+            })
+
+    return {
+        "account_number": acct.get("account_number"),
+        "status": acct.get("status"),
+        "is_paper": "paper" in base.lower(),
+        "equity": equity,
+        "last_equity": last_equity,
+        "cash": cash,
+        "buying_power": float(acct.get("buying_power", 0)),
+        "long_market_value": float(acct.get("long_market_value", 0)),
+        "today_change_dollars": round(equity - last_equity, 2),
+        "today_change_pct": round((equity - last_equity) / last_equity * 100, 3) if last_equity else 0,
+        "positions": pos_list,
+        "orders": order_list,
+    }
 
 
 def _read_trades() -> list[dict]:
@@ -106,6 +193,52 @@ def _compute_portfolio(trades: list[dict], starting_balance: float = 10000.0) ->
     }
 
 
+def _portfolio_from_alpaca(alp: dict, trades: list[dict]) -> dict:
+    """Build the portfolio summary from real Alpaca equity, using local trades
+    for win/loss stats and the equity curve."""
+    equity = alp["equity"]
+    # Alpaca paper accounts start at 100k by default; allow override
+    starting = float(os.getenv("ALPACA_STARTING_EQUITY", "100000"))
+    realised_return = (equity - starting) / starting if starting else 0
+
+    wins = sum(1 for t in trades if t.get("pnl_pct", 0) > 0)
+    losses = sum(1 for t in trades if t.get("pnl_pct", 0) < 0)
+    win_rate = wins / (wins + losses) if (wins + losses) else 0
+
+    # Equity curve from closed trades' realised dollar PnL, anchored at `starting`
+    bal = starting
+    curve = [{"t": "start", "balance": round(bal, 2)}]
+    for t in trades:
+        bal += t.get("pnl_dollars", 0.0)
+        curve.append({"t": t.get("exit_time", ""), "balance": round(bal, 2)})
+    # Final point = real current equity
+    curve.append({"t": "now", "balance": round(equity, 2)})
+
+    peak = starting
+    max_dd = 0.0
+    for pt in curve:
+        peak = max(peak, pt["balance"])
+        dd = (peak - pt["balance"]) / peak if peak else 0
+        max_dd = max(max_dd, dd)
+
+    return {
+        "source": "alpaca",
+        "starting_balance": starting,
+        "current_balance": round(equity, 2),
+        "cash": round(alp["cash"], 2),
+        "invested": round(alp["long_market_value"], 2),
+        "realised_return_pct": round(realised_return * 100, 3),
+        "today_change_dollars": alp["today_change_dollars"],
+        "today_change_pct": alp["today_change_pct"],
+        "max_drawdown_pct": round(max_dd * 100, 3),
+        "total_trades": len(trades),
+        "wins": wins,
+        "losses": losses,
+        "win_rate_pct": round(win_rate * 100, 1),
+        "equity_curve": curve,
+    }
+
+
 @app.get("/api/state")
 def api_state() -> JSONResponse:
     trades = _read_trades()
@@ -114,7 +247,13 @@ def api_state() -> JSONResponse:
     hypotheses = _read_hypotheses()
     heartbeat = _read_heartbeat()
     treasury = _read_treasury()
-    portfolio = _compute_portfolio(trades)
+
+    alpaca = _fetch_alpaca()
+    if alpaca is not None:
+        portfolio = _portfolio_from_alpaca(alpaca, trades)
+    else:
+        portfolio = _compute_portfolio(trades)
+        portfolio["source"] = "simulation"
 
     # DCA progress
     dca_total = sum(d.get("dollars", 0) for d in treasury.get("dca_history", []))
@@ -124,6 +263,7 @@ def api_state() -> JSONResponse:
         "strategy": strategy,
         "goal": goal,
         "portfolio": portfolio,
+        "alpaca": alpaca,
         "trades": trades[-50:],
         "hypotheses": hypotheses[-20:],
         "heartbeat": heartbeat,
@@ -197,7 +337,22 @@ DASHBOARD_HTML = """<!doctype html>
 </head>
 <body>
 <h1>hermes-trading</h1>
-<div class=sub>Self-improving paper trading agent. Refreshes every 10s.</div>
+<div class=sub id=subtitle>Self-improving trading agent. Refreshes every 10s.</div>
+
+<div id=alpaca-banner class=panel style="display:none;border-color:#3a4a6a;margin-bottom:24px">
+  <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
+    <div>
+      <span class="dot ok"></span><b id=alp-mode>Alpaca</b>
+      <span class=muted id=alp-acct style="margin-left:8px"></span>
+    </div>
+    <div style="display:flex;gap:32px;flex-wrap:wrap">
+      <div><div class=label>Account equity</div><div style="font-family:var(--mono);font-size:18px" id=alp-equity>—</div></div>
+      <div><div class=label>Cash</div><div style="font-family:var(--mono);font-size:18px" id=alp-cash>—</div></div>
+      <div><div class=label>Invested</div><div style="font-family:var(--mono);font-size:18px" id=alp-invested>—</div></div>
+      <div><div class=label>Today</div><div style="font-family:var(--mono);font-size:18px" id=alp-today>—</div></div>
+    </div>
+  </div>
+</div>
 
 <div class=grid>
   <div class=card><div class=label>Portfolio value</div>
@@ -212,6 +367,14 @@ DASHBOARD_HTML = """<!doctype html>
   <div class=card><div class=label>Win rate</div>
     <div class=value id=winrate>—</div>
     <div class=muted id=winrate-sub style="font-size:12px;margin-top:6px"></div></div>
+</div>
+
+<div class=panel id=positions-panel style="display:none">
+  <h2>Open positions (live from Alpaca)</h2>
+  <table>
+    <thead><tr><th>Symbol</th><th>Qty</th><th>Avg entry</th><th>Current</th><th>Market value</th><th>Unrealized P/L</th></tr></thead>
+    <tbody id=positions></tbody>
+  </table>
 </div>
 
 <div class=grid>
@@ -250,6 +413,14 @@ DASHBOARD_HTML = """<!doctype html>
   </table>
 </div>
 
+<div class=panel id=orders-panel style="display:none">
+  <h2>Alpaca order fills (live, last 50)</h2>
+  <table>
+    <thead><tr><th>Submitted</th><th>Symbol</th><th>Side</th><th>Qty / Notional</th><th>Fill price</th><th>Status</th></tr></thead>
+    <tbody id=orders></tbody>
+  </table>
+</div>
+
 <div class=panel>
   <h2>Treasury activity</h2>
   <table>
@@ -272,9 +443,53 @@ function fmt(n, decimals=2) { return (n>=0?'+':'') + n.toFixed(decimals); }
 function fmtMoney(n) { return '$' + n.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2}); }
 function load() {
   fetch('/api/state').then(r=>r.json()).then(d=>{
-    const p = d.portfolio, g = d.goal;
+    const p = d.portfolio, g = d.goal, alp = d.alpaca;
+
+    // Alpaca live banner
+    const banner = document.getElementById('alpaca-banner');
+    const posPanel = document.getElementById('positions-panel');
+    if (alp) {
+      banner.style.display = 'block';
+      posPanel.style.display = 'block';
+      document.getElementById('alp-mode').textContent = alp.is_paper ? 'Alpaca — Paper' : 'Alpaca — LIVE (real money)';
+      document.getElementById('alp-acct').textContent = 'acct ' + (alp.account_number||'') + ' · ' + (alp.status||'');
+      document.getElementById('alp-equity').textContent = fmtMoney(alp.equity);
+      document.getElementById('alp-cash').textContent = fmtMoney(alp.cash);
+      document.getElementById('alp-invested').textContent = fmtMoney(alp.long_market_value);
+      const today = document.getElementById('alp-today');
+      today.textContent = fmt(alp.today_change_dollars) + ' (' + fmt(alp.today_change_pct) + '%)';
+      today.style.color = alp.today_change_dollars >= 0 ? 'var(--good)' : 'var(--bad)';
+      document.getElementById('subtitle').textContent =
+        'Live data from your Alpaca ' + (alp.is_paper ? 'paper' : 'LIVE') + ' account. Refreshes every 10s.';
+
+      // Positions table
+      document.getElementById('positions').innerHTML = (alp.positions||[]).map(pos => `
+        <tr>
+          <td>${pos.symbol}</td>
+          <td>${pos.qty}</td>
+          <td>$${pos.avg_entry.toFixed(2)}</td>
+          <td>$${pos.current_price.toFixed(2)}</td>
+          <td>${fmtMoney(pos.market_value)}</td>
+          <td class="${pos.unrealized_pl>=0?'pnl-pos':'pnl-neg'}">${fmt(pos.unrealized_pl)} (${fmt(pos.unrealized_plpc)}%)</td>
+        </tr>`).join('') || '<tr><td colspan=6 class=muted>No open positions — bot is flat, waiting for entry.</td></tr>';
+
+      // Alpaca order fills
+      document.getElementById('orders-panel').style.display = 'block';
+      document.getElementById('orders').innerHTML = (alp.orders||[]).map(o => `
+        <tr>
+          <td>${(o.submitted_at||'').replace('T',' ').replace(/\\..*$/,'')}</td>
+          <td>${o.symbol||''}</td>
+          <td class="${o.side==='buy'?'pnl-pos':'pnl-neg'}">${o.side||''}</td>
+          <td>${o.qty ? (+o.qty).toString() : (o.notional ? '$'+o.notional : '')}</td>
+          <td>${o.filled_avg_price ? '$'+(+o.filled_avg_price).toFixed(2) : '—'}</td>
+          <td class=muted>${o.status||''}</td>
+        </tr>`).join('') || '<tr><td colspan=6 class=muted>No orders yet on Alpaca.</td></tr>';
+    }
+
     document.getElementById('balance').textContent = fmtMoney(p.current_balance);
-    document.getElementById('balance-sub').textContent = 'started at ' + fmtMoney(p.starting_balance) + ' (paper)';
+    document.getElementById('balance-sub').textContent = (p.source === 'alpaca')
+      ? 'Alpaca equity · cash ' + fmtMoney(p.cash||0) + ' + invested ' + fmtMoney(p.invested||0)
+      : 'started at ' + fmtMoney(p.starting_balance) + ' (simulation)';
     const ret = document.getElementById('return');
     ret.textContent = fmt(p.realised_return_pct) + '%';
     ret.className = 'value ' + (p.realised_return_pct >= 0 ? 'good' : 'bad');
