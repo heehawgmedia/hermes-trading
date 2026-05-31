@@ -48,6 +48,20 @@ def _read_heartbeat() -> dict:
         return {}
 
 
+def _read_treasury() -> dict:
+    p = STATE_DIR / "treasury.json"
+    if not p.exists():
+        return {
+            "vault_balance": 0.0, "stock_fund_balance": 0.0,
+            "vault_deposits": [], "stock_fund_deposits": [],
+            "dca_history": [], "vault_park_history": [],
+        }
+    try:
+        return json.loads(p.read_text())
+    except Exception:
+        return {}
+
+
 def _compute_portfolio(trades: list[dict], starting_balance: float = 10000.0) -> dict:
     balance = starting_balance
     equity_curve = [{"t": "start", "balance": balance}]
@@ -99,14 +113,29 @@ def api_state() -> JSONResponse:
     goal = _read_yaml("goal.yaml")
     hypotheses = _read_hypotheses()
     heartbeat = _read_heartbeat()
+    treasury = _read_treasury()
     portfolio = _compute_portfolio(trades)
+
+    # DCA progress
+    dca_total = sum(d.get("dollars", 0) for d in treasury.get("dca_history", []))
+    park_total = sum(d.get("dollars", 0) for d in treasury.get("vault_park_history", []))
+
     return JSONResponse({
         "strategy": strategy,
         "goal": goal,
         "portfolio": portfolio,
-        "trades": trades[-50:],   # last 50
+        "trades": trades[-50:],
         "hypotheses": hypotheses[-20:],
         "heartbeat": heartbeat,
+        "treasury": {
+            "vault_balance": treasury.get("vault_balance", 0),
+            "vault_parked_total_dollars": park_total,
+            "stock_fund_balance": treasury.get("stock_fund_balance", 0),
+            "dca_total_invested": dca_total,
+            "dca_history": treasury.get("dca_history", [])[-20:],
+            "vault_deposits": treasury.get("vault_deposits", [])[-20:],
+            "stock_fund_deposits": treasury.get("stock_fund_deposits", [])[-20:],
+        },
     })
 
 
@@ -185,6 +214,18 @@ DASHBOARD_HTML = """<!doctype html>
     <div class=muted id=winrate-sub style="font-size:12px;margin-top:6px"></div></div>
 </div>
 
+<div class=grid>
+  <div class=card style="border-color:#3a5a3a"><div class=label>Vault (locked)</div>
+    <div class=value id=vault>—</div>
+    <div class=muted id=vault-sub style="font-size:12px;margin-top:6px">10% of every winning trade</div></div>
+  <div class=card style="border-color:#5a3a5a"><div class=label>Stock fund (pending DCA)</div>
+    <div class=value id=fund>—</div>
+    <div class=muted id=fund-sub style="font-size:12px;margin-top:6px">20% skim, fires DCA at $25</div></div>
+  <div class=card style="border-color:#3a4a6a"><div class=label>DCA invested</div>
+    <div class=value id=dca>—</div>
+    <div class=muted id=dca-sub style="font-size:12px;margin-top:6px">ticker not set</div></div>
+</div>
+
 <div class=panel>
   <h2>Equity curve</h2>
   <canvas id=equity></canvas>
@@ -206,6 +247,14 @@ DASHBOARD_HTML = """<!doctype html>
   <table>
     <thead><tr><th>Exit time</th><th>Asset</th><th>Direction</th><th>Entry</th><th>Exit</th><th>PnL %</th><th>Strategy v</th></tr></thead>
     <tbody id=trades></tbody>
+  </table>
+</div>
+
+<div class=panel>
+  <h2>Treasury activity</h2>
+  <table>
+    <thead><tr><th>Time</th><th>Type</th><th>Ticker</th><th>$ amount</th><th>Note</th></tr></thead>
+    <tbody id=treasury-activity></tbody>
   </table>
 </div>
 
@@ -236,6 +285,40 @@ function load() {
     document.getElementById('dd-sub').textContent = 'limit: ' + ((g.max_drawdown||0)*100).toFixed(0) + '%';
     document.getElementById('winrate').textContent = p.win_rate_pct.toFixed(0) + '%';
     document.getElementById('winrate-sub').textContent = p.wins + 'W / ' + p.losses + 'L (' + p.total_trades + ' total)';
+
+    // Treasury cards
+    const tr = d.treasury || {};
+    document.getElementById('vault').textContent = fmtMoney(tr.vault_balance || 0);
+    document.getElementById('vault-sub').textContent =
+      (tr.vault_parked_total_dollars > 0)
+        ? 'parked: ' + fmtMoney(tr.vault_parked_total_dollars)
+        : '10% of every winning trade';
+    document.getElementById('fund').textContent = fmtMoney(tr.stock_fund_balance || 0);
+    document.getElementById('fund-sub').textContent =
+      ((tr.stock_fund_balance || 0) >= 25)
+        ? 'ready to DCA — waiting for ticker'
+        : 'fires at $25 (' + Math.round((tr.stock_fund_balance||0)/25*100) + '%)';
+    document.getElementById('dca').textContent = fmtMoney(tr.dca_total_invested || 0);
+    const lastDca = (tr.dca_history && tr.dca_history.length) ? tr.dca_history[tr.dca_history.length-1] : null;
+    document.getElementById('dca-sub').textContent = lastDca
+      ? 'last buy: ' + lastDca.ticker + ' ' + fmtMoney(lastDca.dollars)
+      : 'no buys yet — set DCA_TICKER';
+
+    // Treasury activity feed (merge deposits, DCA buys, vault park buys)
+    const events = [];
+    (tr.vault_deposits||[]).forEach(e => events.push({t:e.t, type:'vault skim', ticker:'', amt:e.amount, note:''}));
+    (tr.stock_fund_deposits||[]).forEach(e => events.push({t:e.t, type:'fund skim', ticker:'', amt:e.amount, note:''}));
+    (tr.dca_history||[]).forEach(e => events.push({t:e.t, type:'DCA buy', ticker:e.ticker, amt:e.dollars, note:'order '+(e.order_id||'').slice(0,8)}));
+    (tr.vault_park_history||[]).forEach(e => events.push({t:e.t, type:'vault park', ticker:e.ticker, amt:e.dollars, note:'order '+(e.order_id||'').slice(0,8)}));
+    events.sort((a,b)=>b.t.localeCompare(a.t));
+    document.getElementById('treasury-activity').innerHTML = events.slice(0,30).map(e=>`
+      <tr>
+        <td>${e.t.replace('T',' ').replace(/\\..*$/,'')}</td>
+        <td>${e.type}</td>
+        <td>${e.ticker}</td>
+        <td>${fmtMoney(e.amt)}</td>
+        <td class=muted>${e.note}</td>
+      </tr>`).join('') || '<tr><td colspan=5 class=muted>No treasury activity yet — fires on the first winning trade.</td></tr>';
 
     document.getElementById('strategy').textContent = JSON.stringify(d.strategy, null, 2);
     const hb = d.heartbeat;

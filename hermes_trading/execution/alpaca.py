@@ -66,25 +66,30 @@ class AlpacaExecutor(Executor):
             unrealized_pnl_pct=float(p["unrealized_plpc"]),
         )
 
-    async def place_market_order(self, asset: str, side: str, position_size_r: float, current_price: float) -> Order:
+    async def place_market_order(
+        self,
+        asset: str,
+        side: str,
+        position_size_r: float,
+        current_price: float,
+        tradable_cash: float,
+    ) -> Order:
         if side not in ("buy", "sell"):
             raise ValueError(f"side must be 'buy' or 'sell', got {side!r}")
 
-        cash = await self.fetch_cash()
-        dollars_to_deploy = cash * position_size_r
+        dollars_to_deploy = tradable_cash * position_size_r
 
-        # KILL SWITCH: refuse if requested position > max_position_pct of cash
-        if position_size_r > self._max_position_pct * 25:  # 25x buffer since position_size_r is "use this fraction"
-            # The real safety check: actual dollar amount vs account
-            pass
-        max_dollars = cash * (self._max_position_pct if self._is_live else 1.0)
-        # In live mode only, hard-cap a single order to MAX_POSITION_PCT of cash
-        if self._is_live and dollars_to_deploy > max_dollars:
-            raise RuntimeError(
-                f"Kill switch: requested ${dollars_to_deploy:.2f} exceeds "
-                f"MAX_POSITION_PCT={self._max_position_pct*100:.1f}% of ${cash:.2f} cash. "
-                f"Lower position_size_r in strategy.yaml or raise MAX_POSITION_PCT in .env."
-            )
+        # KILL SWITCH: in live (real-money) mode, hard-cap any single order
+        # to MAX_POSITION_PCT of TOTAL account cash (not tradable_cash, to be safer).
+        if self._is_live:
+            total_cash = await self.fetch_cash()
+            max_dollars = total_cash * self._max_position_pct
+            if dollars_to_deploy > max_dollars:
+                raise RuntimeError(
+                    f"Kill switch: requested ${dollars_to_deploy:.2f} exceeds "
+                    f"MAX_POSITION_PCT={self._max_position_pct*100:.1f}% of ${total_cash:.2f} cash. "
+                    f"Lower position_size_r in strategy.yaml or raise MAX_POSITION_PCT in .env."
+                )
 
         qty = round(dollars_to_deploy / current_price, 6)
         alpaca_sym = _to_alpaca_symbol(asset)
@@ -104,6 +109,28 @@ class AlpacaExecutor(Executor):
             side=side,
             qty=qty,
             filled_price=current_price,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            order_id=resp.get("id", ""),
+            status=resp.get("status", "submitted"),
+        )
+
+    async def place_stock_buy(self, ticker: str, dollars: float) -> Order:
+        """Use Alpaca notional orders so we can buy fractional shares with a dollar amount."""
+        # Crypto vs equity have different time_in_force rules
+        is_crypto = "/" in ticker
+        body = {
+            "symbol": ticker,
+            "notional": f"{dollars:.2f}",
+            "side": "buy",
+            "type": "market",
+            "time_in_force": "gtc" if is_crypto else "day",
+        }
+        resp = await self._request("POST", "/v2/orders", json=body)
+        return Order(
+            asset=ticker,
+            side="buy",
+            qty=0.0,  # Alpaca will tell us actual shares in the fill event
+            filled_price=0.0,
             timestamp=datetime.now(timezone.utc).isoformat(),
             order_id=resp.get("id", ""),
             status=resp.get("status", "submitted"),

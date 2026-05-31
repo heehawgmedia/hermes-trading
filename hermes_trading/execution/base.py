@@ -37,16 +37,31 @@ class Executor(ABC):
         """Current open position for the asset, or None."""
 
     @abstractmethod
-    async def place_market_order(self, asset: str, side: str, position_size_r: float, current_price: float) -> Order:
+    async def place_market_order(
+        self,
+        asset: str,
+        side: str,
+        position_size_r: float,
+        current_price: float,
+        tradable_cash: float,
+    ) -> Order:
         """
-        Place a market order. `position_size_r` is the fraction of cash to deploy.
-        Returns the filled Order. Adapters enforce the MAX_POSITION_PCT kill switch
-        before submitting.
+        Place a market order. Deploys `tradable_cash * position_size_r` dollars.
+        `tradable_cash` is computed by the caller (cash minus vault/fund claims).
+        Adapters enforce the MAX_POSITION_PCT kill switch before submitting.
         """
 
     @abstractmethod
     async def close_position(self, asset: str, current_price: float) -> Optional[Order]:
         """Close the open position for `asset`. Returns the exit Order, or None if no position."""
+
+    @abstractmethod
+    async def place_stock_buy(self, ticker: str, dollars: float) -> Order:
+        """
+        Buy `dollars` worth of `ticker` at market — fractional shares OK.
+        Used by the treasury for DCA and vault parking. Distinct from
+        place_market_order (which is for the trading strategy's main asset).
+        """
 
     @property
     @abstractmethod

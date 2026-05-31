@@ -22,11 +22,18 @@ class PaperExecutor(Executor):
     async def fetch_position(self, asset: str) -> Optional[Position]:
         return self._positions.get(asset)
 
-    async def place_market_order(self, asset: str, side: str, position_size_r: float, current_price: float) -> Order:
+    async def place_market_order(
+        self,
+        asset: str,
+        side: str,
+        position_size_r: float,
+        current_price: float,
+        tradable_cash: float,
+    ) -> Order:
         if side not in ("buy", "sell"):
             raise ValueError(f"side must be 'buy' or 'sell', got {side!r}")
 
-        dollars_to_deploy = self._cash * position_size_r
+        dollars_to_deploy = tradable_cash * position_size_r
         qty = dollars_to_deploy / current_price
         signed_qty = qty if side == "buy" else -qty
 
@@ -71,3 +78,17 @@ class PaperExecutor(Executor):
         )
         del self._positions[asset]
         return order
+
+    async def place_stock_buy(self, ticker: str, dollars: float) -> Order:
+        """Paper executor doesn't model stock holdings — log a synthetic order."""
+        if dollars > self._cash:
+            raise RuntimeError(f"Paper executor: cannot stock-buy ${dollars:.2f}, only ${self._cash:.2f} cash")
+        self._cash -= dollars
+        return Order(
+            asset=ticker,
+            side="buy",
+            qty=0.0,  # unknown without price; this is a logical accounting entry
+            filled_price=0.0,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            order_id=f"paper-{uuid.uuid4().hex[:12]}",
+        )

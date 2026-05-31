@@ -10,6 +10,7 @@ import yaml
 
 from hermes_trading.adapters import price as price_adapter
 from hermes_trading.execution import get_executor
+from hermes_trading.treasurer import Treasury
 
 TRADES_PATH = Path("state/trades.jsonl")
 STRATEGY_PATH = Path("state/strategy.yaml")
@@ -94,7 +95,15 @@ async def run_loop(asset: str) -> None:
     global _price_history
     consecutive_failures = 0
     executor = get_executor()
-    print(f"Booting hermes-trading worker — asset={asset} mode={executor.mode}", flush=True)
+    treasury = Treasury()
+    print(
+        f"Booting hermes-trading worker — asset={asset} mode={executor.mode} "
+        f"vault_skim={treasury.config.vault_skim_pct*100:.0f}% "
+        f"fund_skim={treasury.config.stock_fund_skim_pct*100:.0f}% "
+        f"dca_threshold=${treasury.config.stock_fund_dca_threshold:.0f} "
+        f"dca_ticker={treasury.config.dca_ticker or '(unset)'}",
+        flush=True,
+    )
 
     while True:
         tick_start = time.monotonic()
@@ -117,8 +126,16 @@ async def run_loop(asset: str) -> None:
                 position_size_r = float(strategy.get("position_size_r", 0.5))
                 direction = strategy.get("entry", {}).get("direction", "long")
                 side = "buy" if direction == "long" else "sell"
-                order = await executor.place_market_order(asset, side, position_size_r, price)
-                print(f"[ENTER] {executor.mode} {asset} {side} qty={order.qty:.6f} @ {price:.2f}", flush=True)
+                # Tradable cash = total cash minus vault & stock fund claims
+                tradable_cash = max(0.0, (await executor.fetch_cash()) - treasury.claimed_cash)
+                order = await executor.place_market_order(
+                    asset, side,
+                    position_size_r=position_size_r,
+                    current_price=price,
+                    tradable_cash=tradable_cash,
+                )
+                print(f"[ENTER] {executor.mode} {asset} {side} qty={order.qty:.6f} @ {price:.2f} "
+                      f"(tradable=${tradable_cash:.2f})", flush=True)
 
             elif decision == "exit" and position is not None:
                 entry_price = position.avg_entry_price
@@ -127,26 +144,38 @@ async def run_loop(asset: str) -> None:
                     pnl_pct = (price - entry_price) / entry_price
                     if position.qty < 0:
                         pnl_pct = -pnl_pct
+                    qty_abs = abs(position.qty)
+                    profit_dollars = qty_abs * (price - entry_price) if position.qty > 0 \
+                                     else qty_abs * (entry_price - price)
                     trade = {
                         "asset": asset,
                         "entry_price": entry_price,
                         "exit_price": price,
                         "exit_time": datetime.now(timezone.utc).isoformat(),
                         "direction": "long" if position.qty > 0 else "short",
-                        "qty": abs(position.qty),
+                        "qty": qty_abs,
                         "pnl_pct": round(pnl_pct, 6),
+                        "pnl_dollars": round(profit_dollars, 4),
                         "strategy_version": strategy.get("version", "?"),
                         "mode": executor.mode,
                         "exit_order_id": exit_order.order_id,
                     }
                     _log_trade(trade)
-                    print(f"[EXIT]  {executor.mode} {asset} @ {price:.2f}  PnL={pnl_pct:.4%}", flush=True)
+                    print(f"[EXIT]  {executor.mode} {asset} @ {price:.2f}  "
+                          f"PnL={pnl_pct:.4%} (${profit_dollars:+.2f})", flush=True)
+
+                    # Skim winning trades into vault + stock fund
+                    if profit_dollars > 0:
+                        await treasury.on_winning_trade(profit_dollars, executor, exit_order.order_id)
 
             consecutive_failures = 0
             cash = await executor.fetch_cash()
             _write_heartbeat("ok", consecutive_failures, {
                 "mode": executor.mode,
                 "cash": round(cash, 2),
+                "tradable_cash": round(max(0.0, cash - treasury.claimed_cash), 2),
+                "vault_balance": treasury.vault_balance,
+                "stock_fund_balance": treasury.stock_fund_balance,
                 "has_open_position": position is not None,
             })
 
