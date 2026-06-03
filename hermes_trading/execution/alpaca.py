@@ -136,10 +136,31 @@ class AlpacaExecutor(Executor):
             status=resp.get("status", "submitted"),
         )
 
+    async def cancel_open_orders(self, asset: str) -> int:
+        """Cancel any open orders for `asset`. Returns count cancelled.
+        Prevents Alpaca's wash-trade 403 when closing a position."""
+        sym = _to_alpaca_symbol(asset).replace("/", "")
+        try:
+            orders = await self._request("GET", "/v2/orders?status=open&limit=100")
+        except RuntimeError:
+            return 0
+        cancelled = 0
+        for o in orders if isinstance(orders, list) else []:
+            if o.get("symbol", "").replace("/", "") == sym:
+                try:
+                    await self._request("DELETE", f"/v2/orders/{o['id']}")
+                    cancelled += 1
+                except RuntimeError:
+                    pass
+        return cancelled
+
     async def close_position(self, asset: str, current_price: float) -> Optional[Order]:
         pos = await self.fetch_position(asset)
         if pos is None:
             return None
+        # Clear any pending opposite-side orders first, else Alpaca rejects with
+        # a wash-trade 403 ("opposite side market/stop order exists").
+        await self.cancel_open_orders(asset)
         alpaca_sym = _to_alpaca_symbol(asset)
         resp = await self._request("DELETE", f"/v2/positions/{alpaca_sym.replace('/', '')}")
         side = "sell" if pos.qty > 0 else "buy"

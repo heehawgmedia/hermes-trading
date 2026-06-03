@@ -122,51 +122,61 @@ async def run_loop(asset: str) -> None:
                 entry_price=position.avg_entry_price if position else None,
             )
 
-            if decision == "enter":
-                position_size_r = float(strategy.get("position_size_r", 0.5))
-                direction = strategy.get("entry", {}).get("direction", "long")
-                side = "buy" if direction == "long" else "sell"
-                # Tradable cash = total cash minus vault & stock fund claims
-                tradable_cash = max(0.0, (await executor.fetch_cash()) - treasury.claimed_cash)
-                order = await executor.place_market_order(
-                    asset, side,
-                    position_size_r=position_size_r,
-                    current_price=price,
-                    tradable_cash=tradable_cash,
-                )
-                print(f"[ENTER] {executor.mode} {asset} {side} qty={order.qty:.6f} @ {price:.2f} "
-                      f"(tradable=${tradable_cash:.2f})", flush=True)
+            # --- Order actions are RECOVERABLE: a rejected/failed order logs and
+            # --- continues. It must NOT trip the connectivity circuit breaker,
+            # --- otherwise one Alpaca business-rule rejection crashes the worker.
+            try:
+                if decision == "enter":
+                    position_size_r = float(strategy.get("position_size_r", 0.5))
+                    direction = strategy.get("entry", {}).get("direction", "long")
+                    side = "buy" if direction == "long" else "sell"
+                    # Tradable cash = total cash minus vault & stock fund claims
+                    tradable_cash = max(0.0, (await executor.fetch_cash()) - treasury.claimed_cash)
+                    order = await executor.place_market_order(
+                        asset, side,
+                        position_size_r=position_size_r,
+                        current_price=price,
+                        tradable_cash=tradable_cash,
+                    )
+                    print(f"[ENTER] {executor.mode} {asset} {side} qty={order.qty:.6f} @ {price:.2f} "
+                          f"(tradable=${tradable_cash:.2f})", flush=True)
 
-            elif decision == "exit" and position is not None:
-                entry_price = position.avg_entry_price
-                exit_order = await executor.close_position(asset, price)
-                if exit_order is not None:
-                    pnl_pct = (price - entry_price) / entry_price
-                    if position.qty < 0:
-                        pnl_pct = -pnl_pct
-                    qty_abs = abs(position.qty)
-                    profit_dollars = qty_abs * (price - entry_price) if position.qty > 0 \
-                                     else qty_abs * (entry_price - price)
-                    trade = {
-                        "asset": asset,
-                        "entry_price": entry_price,
-                        "exit_price": price,
-                        "exit_time": datetime.now(timezone.utc).isoformat(),
-                        "direction": "long" if position.qty > 0 else "short",
-                        "qty": qty_abs,
-                        "pnl_pct": round(pnl_pct, 6),
-                        "pnl_dollars": round(profit_dollars, 4),
-                        "strategy_version": strategy.get("version", "?"),
-                        "mode": executor.mode,
-                        "exit_order_id": exit_order.order_id,
-                    }
-                    _log_trade(trade)
-                    print(f"[EXIT]  {executor.mode} {asset} @ {price:.2f}  "
-                          f"PnL={pnl_pct:.4%} (${profit_dollars:+.2f})", flush=True)
+                elif decision == "exit" and position is not None:
+                    entry_price = position.avg_entry_price
+                    exit_order = await executor.close_position(asset, price)
+                    if exit_order is not None:
+                        pnl_pct = (price - entry_price) / entry_price
+                        if position.qty < 0:
+                            pnl_pct = -pnl_pct
+                        qty_abs = abs(position.qty)
+                        profit_dollars = qty_abs * (price - entry_price) if position.qty > 0 \
+                                         else qty_abs * (entry_price - price)
+                        trade = {
+                            "asset": asset,
+                            "entry_price": entry_price,
+                            "exit_price": price,
+                            "exit_time": datetime.now(timezone.utc).isoformat(),
+                            "direction": "long" if position.qty > 0 else "short",
+                            "qty": qty_abs,
+                            "pnl_pct": round(pnl_pct, 6),
+                            "pnl_dollars": round(profit_dollars, 4),
+                            "strategy_version": strategy.get("version", "?"),
+                            "mode": executor.mode,
+                            "exit_order_id": exit_order.order_id,
+                        }
+                        _log_trade(trade)
+                        print(f"[EXIT]  {executor.mode} {asset} @ {price:.2f}  "
+                              f"PnL={pnl_pct:.4%} (${profit_dollars:+.2f})", flush=True)
 
-                    # Skim winning trades into vault + stock fund
-                    if profit_dollars > 0:
-                        await treasury.on_winning_trade(profit_dollars, executor, exit_order.order_id)
+                        # Skim winning trades into vault + stock fund
+                        if profit_dollars > 0:
+                            await treasury.on_winning_trade(profit_dollars, executor, exit_order.order_id)
+            except Exception as order_exc:
+                # Recoverable: log, skip this action, keep the worker alive.
+                print(f"[ORDER SKIPPED] {decision} on {asset} rejected: "
+                      f"{str(order_exc)[:200]}", flush=True)
+                _write_heartbeat("order_skipped", consecutive_failures,
+                                 {"last_order_error": str(order_exc)[:200]})
 
             consecutive_failures = 0
             cash = await executor.fetch_cash()
