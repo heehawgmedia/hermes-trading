@@ -63,6 +63,8 @@ def reflect_fallback() -> None:
     realised = sum(returns)
     target = goal["target_return_30d"]
     max_dd_limit = goal["max_drawdown"]
+    min_win_rate = goal.get("min_win_rate", 0.55)
+    win_rate = sum(1 for r in returns if r > 0) / len(returns) if returns else 0.0
 
     # compute simple drawdown
     peak = 0.0
@@ -78,18 +80,24 @@ def reflect_fallback() -> None:
     old_val = None
     new_val = None
 
-    if realised < target:
-        # loosen entry threshold by 2
-        old_val = strategy["entry"]["threshold"]
-        new_val = old_val + 2
-        strategy["entry"]["threshold"] = new_val
-        changed_var = "entry.threshold"
+    if win_rate < min_win_rate:
+        # Win rate too low → tighten take-profit so bounces are banked as wins sooner.
+        old_val = strategy.get("take_profit_pct", 1.5)
+        new_val = round(max(0.5, old_val - 0.2), 2)
+        strategy["take_profit_pct"] = new_val
+        changed_var = "take_profit_pct"
     elif max_dd > max_dd_limit:
         # tighten stop loss by 0.2
         old_val = strategy["stop_loss_pct"]
         new_val = round(old_val - 0.2, 2)
         strategy["stop_loss_pct"] = new_val
         changed_var = "stop_loss_pct"
+    elif realised < target:
+        # loosen entry threshold by 2
+        old_val = strategy["entry"]["threshold"]
+        new_val = old_val + 2
+        strategy["entry"]["threshold"] = new_val
+        changed_var = "entry.threshold"
     else:
         print("[reflect --fallback] Strategy within bounds — no change needed.", flush=True)
         return
@@ -105,7 +113,7 @@ def reflect_fallback() -> None:
         "changed_var": changed_var,
         "old_val": old_val,
         "new_val": new_val,
-        "reason": f"realised={realised:.4f} target={target} dd={max_dd:.4f} dd_limit={max_dd_limit}",
+        "reason": f"win_rate={win_rate:.2f} min={min_win_rate} realised={realised:.4f} target={target} dd={max_dd:.4f} dd_limit={max_dd_limit}",
         "version": new_version,
     }
     _append_hypothesis(hypothesis)

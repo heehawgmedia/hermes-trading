@@ -1,7 +1,8 @@
-version: '02'
+version: "03"
 entry:
   indicator: rsi
   threshold: 32
   direction: long
 stop_loss_pct: 2.0
+take_profit_pct: 1.5      # bank a +1.5% bounce as a win before the -2% stop can fire
 position_size_r: 0.5

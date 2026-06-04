@@ -25,17 +25,27 @@ def score(trades: List[Dict[str, Any]], goal: dict | None = None) -> float:
     realised = float(arr.sum())
     max_dd = _max_drawdown(arr)
     sharpe = _sharpe(arr)
+    win_rate = float((arr > 0).sum()) / len(arr) if len(arr) else 0.0
 
     target = goal["target_return_30d"]
     max_dd_limit = goal["max_drawdown"]
     min_sharpe = goal["min_sharpe"]
+    min_win_rate = goal.get("min_win_rate", 0.55)
     floor = goal.get("failure_below", -0.04)
 
     return_score = _clamp(realised / target, -1.0, 1.0) if target else 0.0
     dd_score = _clamp(1.0 - max_dd / max_dd_limit, -1.0, 1.0) if max_dd_limit else 0.0
     sharpe_score = _clamp(sharpe / min_sharpe, -1.0, 1.0) if min_sharpe else 0.0
+    # Win-rate score: 0 at target, positive above, negative below. Scaled so that
+    # hitting target = neutral-positive and falling to coin-flip (50%) hurts.
+    win_score = _clamp((win_rate - min_win_rate) / max(min_win_rate, 1e-9), -1.0, 1.0) if min_win_rate else 0.0
 
-    composite = (0.5 * return_score + 0.3 * dd_score + 0.2 * sharpe_score)
+    composite = (
+        0.40 * return_score +
+        0.25 * dd_score +
+        0.15 * sharpe_score +
+        0.20 * win_score
+    )
 
     if realised < floor:
         composite = min(composite, -0.8)

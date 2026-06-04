@@ -59,6 +59,7 @@ def _evaluate_strategy(strategy: dict, market: dict, has_position: bool, entry_p
     threshold = float(entry_cfg.get("threshold", 30))
     direction = entry_cfg.get("direction", "long")
     stop_loss_pct = float(strategy.get("stop_loss_pct", 2.0)) / 100
+    take_profit_pct = float(strategy.get("take_profit_pct", 0)) / 100  # 0 = disabled
 
     if indicator == "rsi":
         rsi = _compute_rsi(_price_history)
@@ -69,8 +70,11 @@ def _evaluate_strategy(strategy: dict, market: dict, has_position: bool, entry_p
             assert entry_price is not None
             if direction == "long" and price < entry_price * (1 - stop_loss_pct):
                 return "exit"  # stop loss
+            # Price-based take-profit: bank the bounce as a win before the stop fires.
+            if take_profit_pct > 0 and direction == "long" and price >= entry_price * (1 + take_profit_pct):
+                return "exit"  # take profit (price target hit)
             if direction == "long" and rsi > 70:
-                return "exit"  # take profit
+                return "exit"  # take profit (momentum exhausted)
     return "hold"
 
 
