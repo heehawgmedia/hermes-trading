@@ -9,6 +9,7 @@ from pathlib import Path
 import yaml
 
 from hermes_trading.adapters import price as price_adapter
+from hermes_trading.adapters import bars as bars_adapter
 from hermes_trading.execution import get_executor
 from hermes_trading.treasurer import Treasury
 
@@ -37,45 +38,81 @@ def _load_strategy() -> dict:
         return yaml.safe_load(f)
 
 
-def _compute_rsi(prices: list[float], period: int = 14) -> float:
-    if len(prices) < period + 1:
+def _rsi_wilder(closes: list[float], period: int = 14) -> float:
+    """Wilder-smoothed RSI on real candle closes. Returns 50.0 if insufficient data."""
+    if len(closes) < period + 1:
         return 50.0
     import numpy as np
-    deltas = np.diff(prices[-period - 1:])
-    gains = deltas[deltas > 0].mean() if any(d > 0 for d in deltas) else 0.0
-    losses = -deltas[deltas < 0].mean() if any(d < 0 for d in deltas) else 1e-9
-    rs = gains / losses if losses else 0
-    return 100 - (100 / (1 + rs))
+    arr = np.asarray(closes, dtype=float)
+    deltas = np.diff(arr)
+    gains = np.where(deltas > 0, deltas, 0.0)
+    losses = np.where(deltas < 0, -deltas, 0.0)
+    # Seed with simple average of first `period`, then Wilder-smooth the rest.
+    avg_gain = gains[:period].mean()
+    avg_loss = losses[:period].mean()
+    for i in range(period, len(deltas)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
 
 
-_price_history: list[float] = []
+def _sma(closes: list[float], period: int) -> float | None:
+    """Simple moving average of the last `period` closes, or None if too short."""
+    if len(closes) < period:
+        return None
+    return sum(closes[-period:]) / period
 
 
-def _evaluate_strategy(strategy: dict, market: dict, has_position: bool, entry_price: float | None) -> str:
-    """Returns 'enter', 'exit', or 'hold'."""
-    price = market["price"]
+def _evaluate_strategy(strategy: dict, price: float, closes: list[float],
+                       has_position: bool, entry_price: float | None) -> tuple[str, dict]:
+    """Returns (decision, signals) where decision is 'enter'|'exit'|'hold'.
+    `closes` are real candle closes (oldest→newest). `price` is the live fill price."""
     entry_cfg = strategy.get("entry", {})
     indicator = entry_cfg.get("indicator", "rsi")
     threshold = float(entry_cfg.get("threshold", 30))
+    rsi_period = int(entry_cfg.get("rsi_period", 14))
+    overbought = float(entry_cfg.get("overbought", 70))
     direction = entry_cfg.get("direction", "long")
     stop_loss_pct = float(strategy.get("stop_loss_pct", 2.0)) / 100
     take_profit_pct = float(strategy.get("take_profit_pct", 0)) / 100  # 0 = disabled
 
-    if indicator == "rsi":
-        rsi = _compute_rsi(_price_history)
-        if not has_position:
-            if direction == "long" and rsi < threshold:
-                return "enter"
-        else:
-            assert entry_price is not None
-            if direction == "long" and price < entry_price * (1 - stop_loss_pct):
-                return "exit"  # stop loss
-            # Price-based take-profit: bank the bounce as a win before the stop fires.
-            if take_profit_pct > 0 and direction == "long" and price >= entry_price * (1 + take_profit_pct):
-                return "exit"  # take profit (price target hit)
-            if direction == "long" and rsi > 70:
-                return "exit"  # take profit (momentum exhausted)
-    return "hold"
+    trend_cfg = strategy.get("trend_filter", {}) or {}
+    trend_enabled = bool(trend_cfg.get("enabled", True))
+    trend_period = int(trend_cfg.get("sma_period", 50))
+
+    rsi = _rsi_wilder(closes, rsi_period)
+    trend_sma = _sma(closes, trend_period)
+    # Uptrend = price above its longer moving average. If we don't have enough
+    # candles for the trend SMA yet, stay flat rather than guess.
+    in_uptrend = (trend_sma is not None) and (price > trend_sma)
+    signals = {"rsi": round(rsi, 2),
+               "trend_sma": round(trend_sma, 2) if trend_sma else None,
+               "in_uptrend": in_uptrend}
+
+    if indicator != "rsi":
+        return "hold", signals
+
+    if not has_position:
+        # Long ONLY on an oversold pullback WITHIN an uptrend — never buy a
+        # falling knife in a downtrend. This is the core fix.
+        if direction == "long" and rsi < threshold:
+            if not trend_enabled or in_uptrend:
+                return "enter", signals
+        return "hold", signals
+
+    # Manage the open position.
+    assert entry_price is not None
+    if direction == "long":
+        if price <= entry_price * (1 - stop_loss_pct):
+            return "exit", signals  # stop loss
+        if take_profit_pct > 0 and price >= entry_price * (1 + take_profit_pct):
+            return "exit", signals  # take profit (price target)
+        if rsi >= overbought:
+            return "exit", signals  # momentum exhausted
+    return "hold", signals
 
 
 def _log_trade(trade: dict) -> None:
@@ -96,7 +133,6 @@ def _write_heartbeat(status: str, consecutive_failures: int, extra: dict | None 
 
 
 async def run_loop(asset: str) -> None:
-    global _price_history
     consecutive_failures = 0
     executor = get_executor()
     treasury = Treasury()
@@ -112,16 +148,17 @@ async def run_loop(asset: str) -> None:
     while True:
         tick_start = time.monotonic()
         try:
+            strategy = _load_strategy()
+            timeframe = strategy.get("trend_filter", {}).get("timeframe", "1H")
+            # Real OHLC candles drive the indicators; live spot is the fill reference.
+            candle_data = await _fetch_with_retry(bars_adapter, asset, timeframe, 300)
+            closes = candle_data["closes"]
             market = await _fetch_with_retry(price_adapter, asset)
             price = market["price"]
-            _price_history.append(price)
-            if len(_price_history) > 200:
-                _price_history = _price_history[-200:]
 
-            strategy = _load_strategy()
             position = await executor.fetch_position(asset)
-            decision = _evaluate_strategy(
-                strategy, market,
+            decision, signals = _evaluate_strategy(
+                strategy, price, closes,
                 has_position=position is not None,
                 entry_price=position.avg_entry_price if position else None,
             )
@@ -184,6 +221,10 @@ async def run_loop(asset: str) -> None:
 
             consecutive_failures = 0
             cash = await executor.fetch_cash()
+            if decision == "hold":
+                print(f"[TICK] {asset} {price:.2f} rsi={signals['rsi']} "
+                      f"uptrend={signals['in_uptrend']} pos={position is not None} "
+                      f"src={candle_data['source']}", flush=True)
             _write_heartbeat("ok", consecutive_failures, {
                 "mode": executor.mode,
                 "cash": round(cash, 2),
@@ -191,6 +232,10 @@ async def run_loop(asset: str) -> None:
                 "vault_balance": treasury.vault_balance,
                 "stock_fund_balance": treasury.stock_fund_balance,
                 "has_open_position": position is not None,
+                "rsi": signals["rsi"],
+                "trend_sma": signals["trend_sma"],
+                "in_uptrend": signals["in_uptrend"],
+                "candle_source": candle_data["source"],
             })
 
         except Exception as exc:

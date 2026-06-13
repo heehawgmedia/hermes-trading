@@ -20,21 +20,34 @@ def _migrate_state() -> None:
     """Ensure the persistent-volume copies of strategy.yaml / goal.yaml carry
     newly-added fields. The volume shadows the image's baked-in files, so new
     config keys must be injected here on boot or they never reach the worker."""
-    # --- strategy.yaml: ensure take_profit_pct exists ---
+    # --- strategy.yaml: upgrade to the v04 candle+trend-filter engine ---
     sp = Path("state/strategy.yaml")
     if sp.exists():
         with open(sp) as f:
             strat = yaml.safe_load(f) or {}
-        changed = False
+        changed = []
+        entry = strat.setdefault("entry", {})
+        if "rsi_period" not in entry:
+            entry["rsi_period"] = 14; changed.append("entry.rsi_period")
+        if "overbought" not in entry:
+            entry["overbought"] = 68; changed.append("entry.overbought")
+        # Loosen the dip threshold now that the trend filter guards quality.
+        if entry.get("threshold", 0) < 35:
+            entry["threshold"] = 35; changed.append("entry.threshold=35")
+        if "trend_filter" not in strat:
+            strat["trend_filter"] = {"enabled": True, "sma_period": 50, "timeframe": "1H"}
+            changed.append("trend_filter")
+        # Fix reward:risk — bump the band-aid 1.5% TP to a real 2.5% target.
+        if float(strat.get("take_profit_pct", 0)) < 2.5:
+            strat["take_profit_pct"] = 2.5; changed.append("take_profit_pct=2.5")
         if "take_profit_pct" not in strat:
-            strat["take_profit_pct"] = 1.5  # bank +1.5% bounces as wins
+            strat["take_profit_pct"] = 2.5
+        if changed:
             v = int(str(strat.get("version", "01")))
             strat["version"] = str(v + 1).zfill(2)
-            changed = True
-        if changed:
             with open(sp, "w") as f:
                 yaml.dump(strat, f, default_flow_style=False, sort_keys=False)
-            print(f"[migrate] strategy.yaml -> v{strat['version']} (added take_profit_pct=1.5)", flush=True)
+            print(f"[migrate] strategy.yaml -> v{strat['version']} ({', '.join(changed)})", flush=True)
 
     # --- goal.yaml: ensure min_win_rate exists ---
     gp = Path("state/goal.yaml")

@@ -1,8 +1,14 @@
-version: "03"
+version: "04"
 entry:
   indicator: rsi
-  threshold: 32
+  threshold: 35          # buy the dip when RSI < 35 ...
+  rsi_period: 14
+  overbought: 68         # ... and take profit when momentum exhausts (RSI >= 68)
   direction: long
-stop_loss_pct: 2.0
-take_profit_pct: 1.5      # bank a +1.5% bounce as a win before the -2% stop can fire
+trend_filter:
+  enabled: true          # ONLY go long when price is above the trend SMA
+  sma_period: 50         # 50-period SMA on the candle timeframe below
+  timeframe: "1H"        # 1-hour candles for all indicators
+stop_loss_pct: 2.0       # risk
+take_profit_pct: 2.5     # reward  → 1.25:1 R:R (positive expectancy above ~44% win)
 position_size_r: 0.5
