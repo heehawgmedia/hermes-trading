@@ -20,34 +20,32 @@ def _migrate_state() -> None:
     """Ensure the persistent-volume copies of strategy.yaml / goal.yaml carry
     newly-added fields. The volume shadows the image's baked-in files, so new
     config keys must be injected here on boot or they never reach the worker."""
-    # --- strategy.yaml: upgrade to the v04 candle+trend-filter engine ---
+    # --- strategy.yaml: install the backtest-validated v05 baseline ONCE ---
+    # Version-gated: apply only while the volume strategy is below v05, then leave
+    # it alone so Hermes can evolve from the validated baseline without being
+    # overwritten on every boot.
     sp = Path("state/strategy.yaml")
     if sp.exists():
         with open(sp) as f:
             strat = yaml.safe_load(f) or {}
-        changed = []
-        entry = strat.setdefault("entry", {})
-        if "rsi_period" not in entry:
-            entry["rsi_period"] = 14; changed.append("entry.rsi_period")
-        if "overbought" not in entry:
-            entry["overbought"] = 68; changed.append("entry.overbought")
-        # Loosen the dip threshold now that the trend filter guards quality.
-        if entry.get("threshold", 0) < 35:
-            entry["threshold"] = 35; changed.append("entry.threshold=35")
-        if "trend_filter" not in strat:
-            strat["trend_filter"] = {"enabled": True, "sma_period": 50, "timeframe": "1H"}
-            changed.append("trend_filter")
-        # Fix reward:risk — bump the band-aid 1.5% TP to a real 2.5% target.
-        if float(strat.get("take_profit_pct", 0)) < 2.5:
-            strat["take_profit_pct"] = 2.5; changed.append("take_profit_pct=2.5")
-        if "take_profit_pct" not in strat:
-            strat["take_profit_pct"] = 2.5
-        if changed:
-            v = int(str(strat.get("version", "01")))
-            strat["version"] = str(v + 1).zfill(2)
+        try:
+            cur_v = int(str(strat.get("version", "01")))
+        except ValueError:
+            cur_v = 0
+        if cur_v < 5:
+            strat = {
+                "version": "05",
+                "entry": {"indicator": "rsi", "threshold": 45, "rsi_period": 14,
+                          "overbought": 60, "direction": "long"},
+                "trend_filter": {"enabled": True, "sma_period": 200, "timeframe": "1H"},
+                "stop_loss_pct": 3.0,
+                "take_profit_pct": 5.0,
+                "position_size_r": float(strat.get("position_size_r", 0.5)),
+            }
             with open(sp, "w") as f:
                 yaml.dump(strat, f, default_flow_style=False, sort_keys=False)
-            print(f"[migrate] strategy.yaml -> v{strat['version']} ({', '.join(changed)})", flush=True)
+            print("[migrate] strategy.yaml -> v05 (backtest-validated: px>SMA200 & RSI<45, "
+                  "SL3/TP5)", flush=True)
 
     # --- goal.yaml: ensure min_win_rate exists ---
     gp = Path("state/goal.yaml")
