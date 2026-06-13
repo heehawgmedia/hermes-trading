@@ -63,6 +63,15 @@ class Executor(ABC):
         place_market_order (which is for the trading strategy's main asset).
         """
 
+    async def count_open_orders(self, asset: str) -> int:
+        """Number of unfilled/pending orders for `asset`. Default 0 (paper).
+        Live adapters override this — used to prevent runaway order stacking."""
+        return 0
+
+    async def cancel_open_orders(self, asset: str) -> int:
+        """Cancel pending orders for `asset`; return count cancelled. Default 0 (paper)."""
+        return 0
+
     @property
     @abstractmethod
     def mode(self) -> str:

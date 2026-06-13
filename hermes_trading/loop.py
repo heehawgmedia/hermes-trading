@@ -145,6 +145,15 @@ async def run_loop(asset: str) -> None:
         flush=True,
     )
 
+    # Clean slate: clear any stale orders left by a previous run so we never
+    # resume into a pile of stuck pending orders.
+    try:
+        n = await executor.cancel_open_orders(asset)
+        if n:
+            print(f"[startup] cancelled {n} stale open order(s) for {asset}", flush=True)
+    except Exception as e:
+        print(f"[startup] order cleanup skipped: {e}", flush=True)
+
     while True:
         tick_start = time.monotonic()
         try:
@@ -168,19 +177,29 @@ async def run_loop(asset: str) -> None:
             # --- otherwise one Alpaca business-rule rejection crashes the worker.
             try:
                 if decision == "enter":
-                    position_size_r = float(strategy.get("position_size_r", 0.5))
-                    direction = strategy.get("entry", {}).get("direction", "long")
-                    side = "buy" if direction == "long" else "sell"
-                    # Tradable cash = total cash minus vault & stock fund claims
-                    tradable_cash = max(0.0, (await executor.fetch_cash()) - treasury.claimed_cash)
-                    order = await executor.place_market_order(
-                        asset, side,
-                        position_size_r=position_size_r,
-                        current_price=price,
-                        tradable_cash=tradable_cash,
-                    )
-                    print(f"[ENTER] {executor.mode} {asset} {side} qty={order.qty:.6f} @ {price:.2f} "
-                          f"(tradable=${tradable_cash:.2f})", flush=True)
+                    # GUARD against the runaway-stacking bug: if an order is already
+                    # working for this asset, a market order should have filled within
+                    # a tick. If it's still open, it's stale — cancel it and re-evaluate
+                    # next tick rather than stacking another buy on top.
+                    pending = await executor.count_open_orders(asset)
+                    if pending > 0:
+                        cancelled = await executor.cancel_open_orders(asset)
+                        print(f"[ENTER SKIPPED] {pending} stale pending order(s) for {asset}; "
+                              f"cancelled {cancelled}, re-evaluating next tick", flush=True)
+                    else:
+                        position_size_r = float(strategy.get("position_size_r", 0.5))
+                        direction = strategy.get("entry", {}).get("direction", "long")
+                        side = "buy" if direction == "long" else "sell"
+                        # Tradable cash = total cash minus vault & stock fund claims
+                        tradable_cash = max(0.0, (await executor.fetch_cash()) - treasury.claimed_cash)
+                        order = await executor.place_market_order(
+                            asset, side,
+                            position_size_r=position_size_r,
+                            current_price=price,
+                            tradable_cash=tradable_cash,
+                        )
+                        print(f"[ENTER] {executor.mode} {asset} {side} qty={order.qty:.6f} @ {price:.2f} "
+                              f"(tradable=${tradable_cash:.2f})", flush=True)
 
                 elif decision == "exit" and position is not None:
                     entry_price = position.avg_entry_price

@@ -136,6 +136,18 @@ class AlpacaExecutor(Executor):
             status=resp.get("status", "submitted"),
         )
 
+    async def count_open_orders(self, asset: str) -> int:
+        """Count pending (unfilled) orders for `asset`. Guards against the
+        runaway-stacking bug: never enter while an order is already working."""
+        sym = _to_alpaca_symbol(asset).replace("/", "")
+        try:
+            orders = await self._request("GET", "/v2/orders?status=open&limit=100")
+        except RuntimeError:
+            return 0
+        if not isinstance(orders, list):
+            return 0
+        return sum(1 for o in orders if o.get("symbol", "").replace("/", "") == sym)
+
     async def cancel_open_orders(self, asset: str) -> int:
         """Cancel any open orders for `asset`. Returns count cancelled.
         Prevents Alpaca's wash-trade 403 when closing a position."""
