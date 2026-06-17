@@ -154,6 +154,14 @@ async def run_loop(asset: str) -> None:
     except Exception as e:
         print(f"[startup] order cleanup skipped: {e}", flush=True)
 
+    # Weekly backtest-vs-live edge check runs as a background task (restart-safe).
+    try:
+        from hermes_trading.compare import weekly_loop
+        asyncio.create_task(weekly_loop(asset))
+        print("[startup] weekly backtest-vs-live comparison scheduled", flush=True)
+    except Exception as e:
+        print(f"[startup] comparison scheduler skipped: {e}", flush=True)
+
     while True:
         tick_start = time.monotonic()
         try:

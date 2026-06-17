@@ -149,6 +149,16 @@ def _read_treasury() -> dict:
         return {}
 
 
+def _read_compare() -> dict | None:
+    p = STATE_DIR / "compare_report.json"
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text())
+    except Exception:
+        return None
+
+
 def _compute_portfolio(trades: list[dict], starting_balance: float = 10000.0) -> dict:
     balance = starting_balance
     equity_curve = [{"t": "start", "balance": balance}]
@@ -264,6 +274,7 @@ def api_state() -> JSONResponse:
         "goal": goal,
         "portfolio": portfolio,
         "alpaca": alpaca,
+        "compare": _read_compare(),
         "trades": trades[-50:],
         "hypotheses": hypotheses[-20:],
         "heartbeat": heartbeat,
@@ -387,6 +398,16 @@ DASHBOARD_HTML = """<!doctype html>
   <div class=card style="border-color:#3a4a6a"><div class=label>DCA invested</div>
     <div class=value id=dca>—</div>
     <div class=muted id=dca-sub style="font-size:12px;margin-top:6px">ticker not set</div></div>
+</div>
+
+<div class=panel id=compare-panel style="display:none">
+  <h2>Backtest vs Live — is the edge holding? <span id=cmp-when class=muted style="font-size:12px;font-weight:400"></span></h2>
+  <div id=cmp-verdict style="padding:12px 14px;border-radius:8px;margin-bottom:14px;font-weight:600"></div>
+  <table>
+    <thead><tr><th></th><th>Trades</th><th>Win rate</th><th>Expectancy/trade</th><th>Profit factor</th><th>Max DD</th><th>Total return</th></tr></thead>
+    <tbody id=cmp-rows></tbody>
+  </table>
+  <div id=cmp-flags class=muted style="font-size:12px;margin-top:10px"></div>
 </div>
 
 <div class=panel>
@@ -536,6 +557,31 @@ function load() {
       </tr>`).join('') || '<tr><td colspan=5 class=muted>No treasury activity yet — fires on the first winning trade.</td></tr>';
 
     document.getElementById('strategy').textContent = JSON.stringify(d.strategy, null, 2);
+
+    // Backtest vs Live comparison
+    const cmp = d.compare;
+    if (cmp) {
+      document.getElementById('compare-panel').style.display = 'block';
+      const when = (cmp.generated_at||'').replace('T',' ').replace(/\\..*$/,'');
+      document.getElementById('cmp-when').textContent = '· v' + cmp.strategy_version + ' · last ' + cmp.lookback_days + 'd · ' + when;
+      const colors = {edge_holding:['#13301f','#4ade80'], watch:['#33270d','#fbbf24'],
+                      underperforming:['#3a1414','#f87171'], insufficient_live_data:['#1b2430','#7a8597']};
+      const c = colors[cmp.verdict.status] || colors.insufficient_live_data;
+      const vEl = document.getElementById('cmp-verdict');
+      vEl.style.background = c[0]; vEl.style.color = c[1];
+      vEl.textContent = cmp.verdict.headline;
+      const row = (label, m) => {
+        if (!m || !m.trades) return `<tr><td>${label}</td><td colspan=6 class=muted>no trades</td></tr>`;
+        const pf = m.profit_factor===null||m.profit_factor>999 ? 'inf' : m.profit_factor.toFixed(2);
+        return `<tr><td><b>${label}</b></td><td>${m.trades}</td>
+          <td>${(m.win_rate*100).toFixed(0)}%</td>
+          <td class="${m.expectancy>=0?'pnl-pos':'pnl-neg'}">${(m.expectancy*100>=0?'+':'')}${(m.expectancy*100).toFixed(2)}%</td>
+          <td>${pf}</td><td>${(m.max_drawdown*100).toFixed(1)}%</td>
+          <td class="${m.total_return>=0?'pnl-pos':'pnl-neg'}">${(m.total_return*100>=0?'+':'')}${(m.total_return*100).toFixed(1)}%</td></tr>`;
+      };
+      document.getElementById('cmp-rows').innerHTML = row('Backtest', cmp.backtest) + row('Live', cmp.live);
+      document.getElementById('cmp-flags').innerHTML = (cmp.verdict.flags||[]).map(f=>'⚠ '+f).join('<br>');
+    }
     const hb = d.heartbeat;
     const status = hb.status || 'unknown';
     const dot = status === 'ok' ? 'ok' : 'err';
