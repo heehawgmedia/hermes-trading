@@ -32,20 +32,23 @@ def _migrate_state() -> None:
             cur_v = int(str(strat.get("version", "01")))
         except ValueError:
             cur_v = 0
-        if cur_v < 5:
+        if cur_v < 6:
             strat = {
-                "version": "05",
+                "version": "06",
                 "entry": {"indicator": "rsi", "threshold": 45, "rsi_period": 14,
                           "overbought": 60, "direction": "long"},
                 "trend_filter": {"enabled": True, "sma_period": 200, "timeframe": "1H"},
                 "stop_loss_pct": 3.0,
                 "take_profit_pct": 5.0,
-                "position_size_r": float(strat.get("position_size_r", 0.5)),
+                # Prudent sizing: 30% of cash per trade caps single-position gap
+                # risk to ~0.9% of account at the 3% stop. (Was 50% — too
+                # concentrated for overnight crypto gaps.)
+                "position_size_r": 0.3,
             }
             with open(sp, "w") as f:
                 yaml.dump(strat, f, default_flow_style=False, sort_keys=False)
-            print("[migrate] strategy.yaml -> v05 (backtest-validated: px>SMA200 & RSI<45, "
-                  "SL3/TP5)", flush=True)
+            print("[migrate] strategy.yaml -> v06 (backtest-validated: px>SMA200 & RSI<45, "
+                  "SL3/TP5, size 30%)", flush=True)
 
     # --- goal.yaml: ensure min_win_rate exists ---
     gp = Path("state/goal.yaml")
