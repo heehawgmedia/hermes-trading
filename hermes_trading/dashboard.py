@@ -154,9 +154,22 @@ def _read_compare() -> dict | None:
     if not p.exists():
         return None
     try:
-        return json.loads(p.read_text())
+        rep = json.loads(p.read_text())
     except Exception:
         return None
+    # Defensive: coerce any non-finite floats (Infinity/NaN from older reports)
+    # to None so the JSON response can never 500 the dashboard.
+    import math as _math
+
+    def _clean(o):
+        if isinstance(o, float):
+            return o if _math.isfinite(o) else None
+        if isinstance(o, dict):
+            return {k: _clean(v) for k, v in o.items()}
+        if isinstance(o, list):
+            return [_clean(v) for v in o]
+        return o
+    return _clean(rep)
 
 
 def _compute_portfolio(trades: list[dict], starting_balance: float = 10000.0) -> dict:

@@ -46,12 +46,15 @@ def _trade_metrics(returns: list[float], position_size_r: float = 0.3) -> dict:
     sharpe = 0.0
     if len(arr) > 1 and arr.std(ddof=1) > 0:
         sharpe = float(arr.mean() / arr.std(ddof=1) * math.sqrt(len(arr)))
+    # profit_factor = None (not inf) when there are no losses — inf is NOT valid
+    # JSON and would 500 the dashboard endpoint when serialized.
+    pf = (float(wins.sum() / -losses.sum())
+          if len(losses) and losses.sum() != 0 else None)
     return {
         "trades": int(len(arr)),
         "win_rate": float((arr > 0).mean()),
         "expectancy": float(arr.mean()),
-        "profit_factor": (float(wins.sum() / -losses.sum())
-                          if len(losses) and losses.sum() != 0 else float("inf")),
+        "profit_factor": pf,
         "avg_win": float(wins.mean()) if len(wins) else 0.0,
         "avg_loss": float(losses.mean()) if len(losses) else 0.0,
         "max_drawdown": max_dd,
@@ -219,7 +222,7 @@ def _fmt_row(label: str, m: dict) -> str:
     if m.get("trades", 0) == 0:
         return f"  {label:9} (no trades)"
     pf = m["profit_factor"]
-    pf_s = "inf" if pf == float("inf") else f"{pf:.2f}"
+    pf_s = "inf" if pf is None else f"{pf:.2f}"
     return (f"  {label:9} n={m['trades']:>3}  win={m['win_rate']*100:5.1f}%  "
             f"exp={m['expectancy']*100:+.2f}%/t  PF={pf_s:>4}  "
             f"DD={m['max_drawdown']*100:4.1f}%  ret={m['total_return']*100:+6.1f}%")
@@ -243,6 +246,7 @@ async def weekly_loop(asset: str | None = None, interval_days: int = 7,
     elapsed since the last persisted report, else waits. Survives redeploys
     because the cadence is anchored to the report timestamp on the volume."""
     import asyncio
+    first = True
     while True:
         try:
             last = None
@@ -251,7 +255,10 @@ async def weekly_loop(asset: str | None = None, interval_days: int = 7,
                     last = datetime.fromisoformat(json.loads(REPORT_PATH.read_text())["generated_at"])
                 except Exception:
                     last = None
-            due = last is None or (datetime.now(timezone.utc) - last) >= timedelta(days=interval_days)
+            # Always refresh once on boot (cheap, and overwrites any stale report),
+            # then settle into the weekly cadence.
+            due = first or last is None or (datetime.now(timezone.utc) - last) >= timedelta(days=interval_days)
+            first = False
             if due:
                 r = await run_comparison(asset)
                 v = r["verdict"]
