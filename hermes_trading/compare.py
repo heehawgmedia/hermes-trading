@@ -65,11 +65,15 @@ def _trade_metrics(returns: list[float], position_size_r: float = 0.3) -> dict:
 
 # ----------------------------------------------------------------- live ------
 def _live_returns(lookback_days: int, current_version: str | None) -> tuple[list[float], int]:
+    """Live returns for trades taken under the CURRENT strategy version only —
+    otherwise we'd be grading this strategy on trades the old (broken) strategies
+    made. Returns (returns, n_excluded_other_version)."""
     path = STATE / "trades.jsonl"
     if not path.exists():
         return [], 0
     cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
-    returns, skipped = [], 0
+    cur = str(current_version) if current_version is not None else None
+    returns, excluded_other_version = [], 0
     for line in path.read_text().splitlines():
         line = line.strip()
         if not line:
@@ -78,9 +82,8 @@ def _live_returns(lookback_days: int, current_version: str | None) -> tuple[list
             t = json.loads(line)
         except Exception:
             continue
-        # Only count REAL executor trades (have a mode), not synthetic seeds.
+        # Only REAL executor trades (have a mode), not synthetic seeds.
         if "mode" not in t:
-            skipped += 1
             continue
         ts = t.get("exit_time", "")
         try:
@@ -89,8 +92,12 @@ def _live_returns(lookback_days: int, current_version: str | None) -> tuple[list
             when = None
         if when is not None and when < cutoff:
             continue
+        # Apples-to-apples: only trades made by the strategy we're backtesting.
+        if cur is not None and str(t.get("strategy_version")) != cur:
+            excluded_other_version += 1
+            continue
         returns.append(float(t.get("pnl_pct", 0.0)))
-    return returns, skipped
+    return returns, excluded_other_version
 
 
 # --------------------------------------------------------------- backtest ----
@@ -146,8 +153,8 @@ def _verdict(live: dict, bt: dict) -> dict:
     flags = []
     if live.get("trades", 0) < 3:
         return {"status": "insufficient_live_data",
-                "headline": f"Only {live.get('trades', 0)} live trade(s) in window — "
-                            "need ≥3 before judging the edge.",
+                "headline": f"Only {live.get('trades', 0)} live trade(s) under this strategy "
+                            "version so far - need at least 3 before judging the edge.",
                 "flags": flags}
 
     # Win-rate gap
@@ -158,12 +165,12 @@ def _verdict(live: dict, bt: dict) -> dict:
     # Expectancy sign mismatch (the big one)
     if bt["expectancy"] > 0 and live["expectancy"] <= 0:
         flags.append(f"Live expectancy {live['expectancy']*100:+.2f}%/trade is negative "
-                     f"while backtest is {bt['expectancy']*100:+.2f}% — edge NOT holding "
+                     f"while backtest is {bt['expectancy']*100:+.2f}% - edge NOT holding "
                      "out-of-sample.")
     # Drawdown blowout
     if live["max_drawdown"] > max(bt["max_drawdown"] * 1.5, 0.04):
         flags.append(f"Live drawdown {live['max_drawdown']*100:.1f}% exceeds "
-                     f"1.5× backtest {bt['max_drawdown']*100:.1f}%.")
+                     f"1.5x backtest {bt['max_drawdown']*100:.1f}%.")
 
     if not flags:
         status = "edge_holding"
@@ -172,10 +179,10 @@ def _verdict(live: dict, bt: dict) -> dict:
                     f"{bt['expectancy']*100:+.2f}%. Edge holding.")
     elif any("NOT holding" in f for f in flags):
         status = "underperforming"
-        headline = "LIVE UNDERPERFORMING the backtest — investigate before trusting the edge."
+        headline = "LIVE UNDERPERFORMING the backtest - investigate before trusting the edge."
     else:
         status = "watch"
-        headline = "Live diverging from backtest — watch closely."
+        headline = "Live diverging from backtest - watch closely."
     return {"status": status, "headline": headline, "flags": flags}
 
 
@@ -190,7 +197,7 @@ async def run_comparison(asset: str | None = None, lookback_days: int = 30) -> d
     psize = float(strategy.get("position_size_r", 0.3))
     version = strategy.get("version")
 
-    live_ret, seeds_skipped = _live_returns(lookback_days, version)
+    live_ret, excluded_other_version = _live_returns(lookback_days, version)
     try:
         bt_ret = await _backtest_returns(asset, strategy, lookback_days)
     except Exception as e:
@@ -209,7 +216,7 @@ async def run_comparison(asset: str | None = None, lookback_days: int = 30) -> d
         "live": live_m,
         "backtest": bt_m,
         "verdict": verdict,
-        "seed_trades_skipped": seeds_skipped,
+        "live_trades_excluded_other_version": excluded_other_version,
     }
     STATE.mkdir(exist_ok=True)
     REPORT_PATH.write_text(json.dumps(report, indent=2))
