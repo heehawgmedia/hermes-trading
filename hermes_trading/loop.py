@@ -132,12 +132,37 @@ def _write_heartbeat(status: str, consecutive_failures: int, extra: dict | None 
         json.dump(data, f)
 
 
+def _load_watchlist(fallback: str) -> list[str]:
+    """Assets to scan for entries. From goal.yaml `watchlist`, else [primary asset]."""
+    try:
+        with open(GOAL_PATH) as f:
+            goal = yaml.safe_load(f) or {}
+        wl = goal.get("watchlist")
+        if wl:
+            return list(dict.fromkeys(wl))  # de-dupe, preserve order
+        return [goal.get("asset", fallback)]
+    except Exception:
+        return [fallback]
+
+
+async def _snapshot(asset: str, timeframe: str) -> tuple[float, list[float], str]:
+    """Real candles + fill price for one asset, both from Alpaca bars.
+
+    Using the latest candle close as the fill reference (rather than a separate
+    CoinGecko spot call) keeps the price source consistent with the indicators,
+    matches how the backtest prices fills, and works for every Alpaca coin
+    (CoinGecko's spot endpoint only mapped a handful of tickers)."""
+    candle_data = await _fetch_with_retry(bars_adapter, asset, timeframe, 300)
+    return float(candle_data["last_price"]), candle_data["closes"], candle_data["source"]
+
+
 async def run_loop(asset: str) -> None:
     consecutive_failures = 0
     executor = get_executor()
     treasury = Treasury()
+    watchlist = _load_watchlist(asset)
     print(
-        f"Booting hermes-trading worker — asset={asset} mode={executor.mode} "
+        f"Booting hermes-trading worker — watchlist={watchlist} mode={executor.mode} "
         f"vault_skim={treasury.config.vault_skim_pct*100:.0f}% "
         f"fund_skim={treasury.config.stock_fund_skim_pct*100:.0f}% "
         f"dca_threshold=${treasury.config.stock_fund_dca_threshold:.0f} "
@@ -145,14 +170,14 @@ async def run_loop(asset: str) -> None:
         flush=True,
     )
 
-    # Clean slate: clear any stale orders left by a previous run so we never
-    # resume into a pile of stuck pending orders.
-    try:
-        n = await executor.cancel_open_orders(asset)
-        if n:
-            print(f"[startup] cancelled {n} stale open order(s) for {asset}", flush=True)
-    except Exception as e:
-        print(f"[startup] order cleanup skipped: {e}", flush=True)
+    # Clean slate: clear any stale orders across the whole watchlist.
+    for a in watchlist:
+        try:
+            n = await executor.cancel_open_orders(a)
+            if n:
+                print(f"[startup] cancelled {n} stale open order(s) for {a}", flush=True)
+        except Exception as e:
+            print(f"[startup] order cleanup skipped for {a}: {e}", flush=True)
 
     # Weekly backtest-vs-live edge check runs as a background task (restart-safe).
     try:
@@ -167,103 +192,108 @@ async def run_loop(asset: str) -> None:
         try:
             strategy = _load_strategy()
             timeframe = strategy.get("trend_filter", {}).get("timeframe", "1H")
-            # Real OHLC candles drive the indicators; live spot is the fill reference.
-            candle_data = await _fetch_with_retry(bars_adapter, asset, timeframe, 300)
-            closes = candle_data["closes"]
-            market = await _fetch_with_retry(price_adapter, asset)
-            price = market["price"]
+            watchlist = _load_watchlist(asset)  # re-read so Hermes edits take effect
 
-            position = await executor.fetch_position(asset)
-            decision, signals = _evaluate_strategy(
-                strategy, price, closes,
-                has_position=position is not None,
-                entry_price=position.avg_entry_price if position else None,
-            )
+            # Single position at a time: if we hold one, manage it; else scan for the
+            # best new entry across the watchlist.
+            held = [p for p in await executor.fetch_all_positions() if p.asset in watchlist]
 
-            # --- Order actions are RECOVERABLE: a rejected/failed order logs and
-            # --- continues. It must NOT trip the connectivity circuit breaker,
-            # --- otherwise one Alpaca business-rule rejection crashes the worker.
             try:
-                if decision == "enter":
-                    # GUARD against the runaway-stacking bug: if an order is already
-                    # working for this asset, a market order should have filled within
-                    # a tick. If it's still open, it's stale — cancel it and re-evaluate
-                    # next tick rather than stacking another buy on top.
-                    pending = await executor.count_open_orders(asset)
-                    if pending > 0:
-                        cancelled = await executor.cancel_open_orders(asset)
-                        print(f"[ENTER SKIPPED] {pending} stale pending order(s) for {asset}; "
-                              f"cancelled {cancelled}, re-evaluating next tick", flush=True)
+                if held:
+                    pos = held[0]
+                    active = pos.asset
+                    price, closes, source = await _snapshot(active, timeframe)
+                    decision, signals = _evaluate_strategy(
+                        strategy, price, closes,
+                        has_position=True, entry_price=pos.avg_entry_price)
+
+                    if decision == "exit":
+                        exit_order = await executor.close_position(active, price)
+                        if exit_order is not None:
+                            entry_price = pos.avg_entry_price
+                            pnl_pct = (price - entry_price) / entry_price
+                            if pos.qty < 0:
+                                pnl_pct = -pnl_pct
+                            qty_abs = abs(pos.qty)
+                            profit_dollars = (qty_abs * (price - entry_price) if pos.qty > 0
+                                              else qty_abs * (entry_price - price))
+                            trade = {
+                                "asset": active, "entry_price": entry_price, "exit_price": price,
+                                "exit_time": datetime.now(timezone.utc).isoformat(),
+                                "direction": "long" if pos.qty > 0 else "short",
+                                "qty": qty_abs, "pnl_pct": round(pnl_pct, 6),
+                                "pnl_dollars": round(profit_dollars, 4),
+                                "strategy_version": strategy.get("version", "?"),
+                                "mode": executor.mode, "exit_order_id": exit_order.order_id,
+                            }
+                            _log_trade(trade)
+                            print(f"[EXIT]  {executor.mode} {active} @ {price:.2f}  "
+                                  f"PnL={pnl_pct:.4%} (${profit_dollars:+.2f})", flush=True)
+                            if profit_dollars > 0:
+                                await treasury.on_winning_trade(profit_dollars, executor, exit_order.order_id)
+                        active_signals = signals
                     else:
-                        position_size_r = float(strategy.get("position_size_r", 0.5))
-                        direction = strategy.get("entry", {}).get("direction", "long")
-                        side = "buy" if direction == "long" else "sell"
-                        # Tradable cash = total cash minus vault & stock fund claims
-                        tradable_cash = max(0.0, (await executor.fetch_cash()) - treasury.claimed_cash)
-                        order = await executor.place_market_order(
-                            asset, side,
-                            position_size_r=position_size_r,
-                            current_price=price,
-                            tradable_cash=tradable_cash,
-                        )
-                        print(f"[ENTER] {executor.mode} {asset} {side} qty={order.qty:.6f} @ {price:.2f} "
-                              f"(tradable=${tradable_cash:.2f})", flush=True)
+                        print(f"[HOLD]  {active} {price:.2f} rsi={signals['rsi']} "
+                              f"uptrend={signals['in_uptrend']} src={source}", flush=True)
+                        active_signals = signals
 
-                elif decision == "exit" and position is not None:
-                    entry_price = position.avg_entry_price
-                    exit_order = await executor.close_position(asset, price)
-                    if exit_order is not None:
-                        pnl_pct = (price - entry_price) / entry_price
-                        if position.qty < 0:
-                            pnl_pct = -pnl_pct
-                        qty_abs = abs(position.qty)
-                        profit_dollars = qty_abs * (price - entry_price) if position.qty > 0 \
-                                         else qty_abs * (entry_price - price)
-                        trade = {
-                            "asset": asset,
-                            "entry_price": entry_price,
-                            "exit_price": price,
-                            "exit_time": datetime.now(timezone.utc).isoformat(),
-                            "direction": "long" if position.qty > 0 else "short",
-                            "qty": qty_abs,
-                            "pnl_pct": round(pnl_pct, 6),
-                            "pnl_dollars": round(profit_dollars, 4),
-                            "strategy_version": strategy.get("version", "?"),
-                            "mode": executor.mode,
-                            "exit_order_id": exit_order.order_id,
-                        }
-                        _log_trade(trade)
-                        print(f"[EXIT]  {executor.mode} {asset} @ {price:.2f}  "
-                              f"PnL={pnl_pct:.4%} (${profit_dollars:+.2f})", flush=True)
+                else:
+                    # FLAT → scan watchlist, pick the best pullback-in-uptrend setup
+                    # (most oversold = lowest RSI among assets that pass the trend filter).
+                    candidates = []
+                    scan = []
+                    for a in watchlist:
+                        try:
+                            price, closes, source = await _snapshot(a, timeframe)
+                        except Exception as se:
+                            print(f"[scan] {a} data error: {str(se)[:80]}", flush=True)
+                            continue
+                        decision, signals = _evaluate_strategy(
+                            strategy, price, closes, has_position=False, entry_price=None)
+                        scan.append(f"{a}:rsi{signals['rsi']}/{'up' if signals['in_uptrend'] else 'dn'}")
+                        if decision == "enter":
+                            candidates.append((signals["rsi"], a, price, signals))
+                    print(f"[SCAN] flat — {'  '.join(scan)}", flush=True)
 
-                        # Skim winning trades into vault + stock fund
-                        if profit_dollars > 0:
-                            await treasury.on_winning_trade(profit_dollars, executor, exit_order.order_id)
+                    active_signals = None
+                    if candidates:
+                        candidates.sort(key=lambda c: c[0])  # lowest RSI first
+                        _, chosen, price, active_signals = candidates[0]
+                        pending = await executor.count_open_orders(chosen)
+                        if pending > 0:
+                            await executor.cancel_open_orders(chosen)
+                            print(f"[ENTER SKIPPED] stale pending order(s) for {chosen}", flush=True)
+                        else:
+                            position_size_r = float(strategy.get("position_size_r", 0.3))
+                            tradable_cash = max(0.0, (await executor.fetch_cash()) - treasury.claimed_cash)
+                            order = await executor.place_market_order(
+                                chosen, "buy", position_size_r=position_size_r,
+                                current_price=price, tradable_cash=tradable_cash)
+                            print(f"[ENTER] {executor.mode} {chosen} buy qty={order.qty:.6f} @ {price:.2f} "
+                                  f"(rsi={active_signals['rsi']}, tradable=${tradable_cash:.2f})", flush=True)
             except Exception as order_exc:
-                # Recoverable: log, skip this action, keep the worker alive.
-                print(f"[ORDER SKIPPED] {decision} on {asset} rejected: "
-                      f"{str(order_exc)[:200]}", flush=True)
+                print(f"[ORDER SKIPPED] action rejected: {str(order_exc)[:200]}", flush=True)
                 _write_heartbeat("order_skipped", consecutive_failures,
                                  {"last_order_error": str(order_exc)[:200]})
+                active_signals = None
 
             consecutive_failures = 0
             cash = await executor.fetch_cash()
-            if decision == "hold":
-                print(f"[TICK] {asset} {price:.2f} rsi={signals['rsi']} "
-                      f"uptrend={signals['in_uptrend']} pos={position is not None} "
-                      f"src={candle_data['source']}", flush=True)
-            _write_heartbeat("ok", consecutive_failures, {
+            hb = {
                 "mode": executor.mode,
                 "cash": round(cash, 2),
                 "tradable_cash": round(max(0.0, cash - treasury.claimed_cash), 2),
                 "vault_balance": treasury.vault_balance,
                 "stock_fund_balance": treasury.stock_fund_balance,
-                "has_open_position": position is not None,
-                "rsi": signals["rsi"],
-                "trend_sma": signals["trend_sma"],
-                "in_uptrend": signals["in_uptrend"],
-                "candle_source": candle_data["source"],
-            })
+                "has_open_position": bool(held),
+                "active_asset": held[0].asset if held else None,
+                "watchlist": watchlist,
+            }
+            if active_signals:
+                hb.update({"rsi": active_signals["rsi"],
+                           "trend_sma": active_signals["trend_sma"],
+                           "in_uptrend": active_signals["in_uptrend"]})
+            _write_heartbeat("ok", consecutive_failures, hb)
 
         except Exception as exc:
             consecutive_failures += 1

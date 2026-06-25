@@ -1,4 +1,12 @@
-asset: "BTC/USDT"
+asset: "BTC/USDT"            # primary / fallback
+# Watchlist for multi-asset rotation — the bot holds ONE position at a time in
+# whichever coin has the best pullback-in-uptrend setup. Each coin was backtest-
+# validated with the v06 params (SOL excluded — it lost across windows).
+watchlist:
+  - "BTC/USDT"
+  - "ETH/USDT"
+  - "LTC/USDT"
+  - "LINK/USDT"
 target_return_30d: 0.10      # success
 max_drawdown:      0.08      # failure
 min_sharpe:        1.2       # quality bar

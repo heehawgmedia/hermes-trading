@@ -36,6 +36,10 @@ class Executor(ABC):
     async def fetch_position(self, asset: str) -> Optional[Position]:
         """Current open position for the asset, or None."""
 
+    async def fetch_all_positions(self) -> list[Position]:
+        """All open positions (for multi-asset rotation). Default: empty."""
+        return []
+
     @abstractmethod
     async def place_market_order(
         self,

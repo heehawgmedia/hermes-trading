@@ -50,16 +50,23 @@ def _migrate_state() -> None:
             print("[migrate] strategy.yaml -> v06 (backtest-validated: px>SMA200 & RSI<45, "
                   "SL3/TP5, size 30%)", flush=True)
 
-    # --- goal.yaml: ensure min_win_rate exists ---
+    # --- goal.yaml: ensure min_win_rate + multi-asset watchlist exist ---
     gp = Path("state/goal.yaml")
     if gp.exists():
         with open(gp) as f:
             goal = yaml.safe_load(f) or {}
+        changed = []
         if "min_win_rate" not in goal:
             goal["min_win_rate"] = 0.55
+            changed.append("min_win_rate=0.55")
+        if not goal.get("watchlist"):
+            # Backtest-validated coins (SOL excluded — lost across windows).
+            goal["watchlist"] = ["BTC/USDT", "ETH/USDT", "LTC/USDT", "LINK/USDT"]
+            changed.append("watchlist=BTC/ETH/LTC/LINK")
+        if changed:
             with open(gp, "w") as f:
                 yaml.dump(goal, f, default_flow_style=False, sort_keys=False)
-            print("[migrate] goal.yaml (added min_win_rate=0.55)", flush=True)
+            print(f"[migrate] goal.yaml ({', '.join(changed)})", flush=True)
 
 
 def main() -> None:

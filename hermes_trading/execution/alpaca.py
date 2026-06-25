@@ -20,6 +20,13 @@ def _to_alpaca_symbol(asset: str) -> str:
     return f"{base}/USD"
 
 
+def _from_alpaca_symbol(sym: str) -> str:
+    # "BTCUSD" or "BTC/USD" -> "BTC/USDT" (canonical ccxt-style used internally)
+    s = sym.replace("/", "")
+    base = s[:-3] if s.endswith("USD") else s
+    return f"{base}/USDT"
+
+
 class AlpacaExecutor(Executor):
     def __init__(self, api_key: str, api_secret: str, base_url: str, max_position_pct: float = 0.02):
         self._headers = {
@@ -65,6 +72,25 @@ class AlpacaExecutor(Executor):
             market_value=float(p["market_value"]),
             unrealized_pnl_pct=float(p["unrealized_plpc"]),
         )
+
+    async def fetch_all_positions(self) -> list[Position]:
+        """All open crypto positions, mapped back to canonical assets."""
+        rows = await self._request("GET", "/v2/positions")
+        out: list[Position] = []
+        for p in rows if isinstance(rows, list) else []:
+            if p.get("asset_class") not in (None, "crypto"):
+                continue  # ignore non-crypto (e.g. treasury BIL/DCA stock holdings)
+            qty = float(p["qty"])
+            if p.get("side") == "short":
+                qty = -qty
+            out.append(Position(
+                asset=_from_alpaca_symbol(p["symbol"]),
+                qty=qty,
+                avg_entry_price=float(p["avg_entry_price"]),
+                market_value=float(p["market_value"]),
+                unrealized_pnl_pct=float(p.get("unrealized_plpc", 0) or 0),
+            ))
+        return out
 
     async def place_market_order(
         self,

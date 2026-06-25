@@ -22,6 +22,9 @@ class PaperExecutor(Executor):
     async def fetch_position(self, asset: str) -> Optional[Position]:
         return self._positions.get(asset)
 
+    async def fetch_all_positions(self) -> list[Position]:
+        return list(self._positions.values())
+
     async def place_market_order(
         self,
         asset: str,
